@@ -128,6 +128,7 @@ class TrajectoryConstraints(object):
         # Minimum and maximum average velocities (km/s)
         self.v_avg_min = 3.0
         self.v_avg_max = 73.0
+        self.lowvel = False
 
         ### ###
 
@@ -596,7 +597,8 @@ class TrajectoryCorrelator(object):
             mc_runs=mc_runs, mc_runs_max=2*mc_runs,
             show_plots=False, verbose=verbose, save_results=False, 
             reject_n_sigma_outliers=2, mc_cores=self.traj_constraints.mc_cores, 
-            geometric_uncert=self.traj_constraints.geometric_uncert, enable_OSM_plot=self.enableOSM)
+            geometric_uncert=self.traj_constraints.geometric_uncert, 
+            enable_OSM_plot=self.enableOSM, lowvel=self.traj_constraints.lowvel)
 
         return traj
 
@@ -622,6 +624,7 @@ class TrajectoryCorrelator(object):
 
         # Reference Julian date (the one in the traj object may change later, after timing offset estimation,
         #   so we keep this one as a "hard" reference)
+        lowvel = traj.lowvel
         jdt_ref = traj.jdt_ref
         saved_traj_id = traj.traj_id
         log.info("")
@@ -871,22 +874,22 @@ class TrajectoryCorrelator(object):
         # if we're only doing the simple solution, then print the results
         if mcmode == 1:
             # Only proceed if the orbit could be computed
-            if traj.orbit.ra_g is not None:
+            if lowvel:
                 # Update trajectory file name
                 traj.generateFileName()
-
-                log.info("")
-                log.info("RA_g  = {:7.3f} deg".format(np.degrees(traj.orbit.ra_g)))
-                log.info("Deg_g = {:+7.3f} deg".format(np.degrees(traj.orbit.dec_g)))
-                log.info("V_g   = {:6.2f} km/s".format(traj.orbit.v_g/1000))
-                shower_obj = associateShowerTraj(traj)
-                if shower_obj is None:
-                    shower_code = '...'
-                else:
-                    shower_code = shower_obj.IAU_code
-                log.info("Shower: {:s}".format(shower_code))
-            successful_traj_fit = True
-            log.info('finished initial solution')
+                if traj.orbit.ra_g is not None:
+                    log.info("")
+                    log.info("RA_g  = {:7.3f} deg".format(np.degrees(traj.orbit.ra_g)))
+                    log.info("Deg_g = {:+7.3f} deg".format(np.degrees(traj.orbit.dec_g)))
+                    log.info("V_g   = {:6.2f} km/s".format(traj.orbit.v_g/1000))
+                    shower_obj = associateShowerTraj(traj)
+                    if shower_obj is None:
+                        shower_code = '...'
+                    else:
+                        shower_code = shower_obj.IAU_code
+                    log.info("Shower: {:s}".format(shower_code))
+                successful_traj_fit = True
+                log.info('finished initial solution')
 
         ##### end of simple soln phase 
         ##### now run the Monte-carlo phase, if the mcmode is 0 (do both) or 2 (mc-only)

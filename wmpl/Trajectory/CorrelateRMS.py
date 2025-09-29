@@ -1787,6 +1787,9 @@ contain data folders. Data folders should have FTPdetectinfo files together with
     
     arg_parser.add_argument('--verbose', '--verbose', help='Verbose logging.', default=False, action="store_true")
 
+    arg_parser.add_argument("--lowvel", type=bool, default=False, 
+        help="Tammy's changes to search for and process lower velocity events without geocentric solutions")
+
     # Parse the command line arguments
     cml_args = arg_parser.parse_args()
 
@@ -1860,6 +1863,9 @@ contain data folders. Data folders should have FTPdetectinfo files together with
     trajectory_constraints.save_plots = cml_args.saveplots
     trajectory_constraints.geometric_uncert = not cml_args.uncerttime
     trajectory_constraints.max_stations = max_stations
+    trajectory_constraints.lowvel = cml_args.lowvel
+    if cml_args.lowvel:
+        trajectory_constraints.v_avg_max = 12.0
 
     if cml_args.minerr is not None:
         trajectory_constraints.min_arcsec_err = cml_args.minerr

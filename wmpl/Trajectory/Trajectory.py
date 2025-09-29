@@ -2451,7 +2451,7 @@ class Trajectory(object):
         mc_noise_std=1.0, geometric_uncert=False, filter_picks=True, calc_orbit=True, show_plots=True, \
         show_jacchia=False, save_results=True, gravity_correction=True, gravity_factor=1.0, \
         plot_all_spatial_residuals=False, plot_file_type='png', traj_id=None, reject_n_sigma_outliers=3, 
-        mc_cores=None, fixed_times=None, mc_runs_max=None, enable_OSM_plot=False):
+        mc_cores=None, fixed_times=None, mc_runs_max=None, enable_OSM_plot=False, lowvel=False):
         """ Init the Ceplecha trajectory solver.
 
         Arguments:
@@ -2512,6 +2512,7 @@ class Trajectory(object):
             mc_runs_max: [int] Maximum number of Monte Carlo runs. None by default, which will limit the runs
                 to 10x req_num.
             enable_OSM_plot: [bool] plot the ground track using OS maps as well as the default 
+            lowvel: [bool] Restric the range to lower velocities and ignore the check for computable geocentric orbit
 
         """
 
@@ -2531,6 +2532,9 @@ class Trajectory(object):
 
         # If verbose True, results and status messages will be printed out, otherwise they will be supressed
         self.verbose = verbose
+
+        # If lowvel True, velocities higher than 12 km/s will be rejected and trajectories that have non-computable geocentric orbits will be allowed
+        self.lowvel = lowvel
 
         # Fixed part from the beginning of the meteor on which the initial velocity estimation using the 
         #   sliding fit will start
