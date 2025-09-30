@@ -1865,7 +1865,7 @@ contain data folders. Data folders should have FTPdetectinfo files together with
     trajectory_constraints.max_stations = max_stations
     trajectory_constraints.lowvel = cml_args.lowvel
     if cml_args.lowvel:
-        trajectory_constraints.v_avg_max = 12.0
+        trajectory_constraints.v_avg_max = 11.2
 
     if cml_args.minerr is not None:
         trajectory_constraints.min_arcsec_err = cml_args.minerr
