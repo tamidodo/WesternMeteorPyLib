@@ -1612,6 +1612,7 @@ def calcMCUncertainties(traj_list, traj_best):
     un.htmin_ele_wgs84_ci = confidenceInterval([traj.htmin_ele_wgs84 for traj in traj_list], un.ci)
 
 
+    # Orbit uncertainties
     if traj_best.orbit is not None:
 
         # Apparent ECI
@@ -1659,105 +1660,109 @@ def calcMCUncertainties(traj_list, traj_best):
         un.ht_ref_wgs84 = np.std([traj.orbit.ht_ref_wgs84 for traj in traj_list])
         un.ht_ref_wgs84_ci = confidenceInterval([traj.orbit.ht_ref_wgs84 for traj in traj_list], un.ci)
 
-        # Geocentric
-        un.ra_g = scipy.stats.circstd([traj.orbit.ra_g for traj in traj_list])
-        un.ra_g_ci = confidenceInterval([traj.orbit.ra_g for traj in traj_list], un.ci, angle=True)
-        un.dec_g = np.std([traj.orbit.dec_g for traj in traj_list])
-        un.dec_g_ci = confidenceInterval([traj.orbit.dec_g for traj in traj_list], un.ci)
-        un.v_g = np.std([traj.orbit.v_g for traj in traj_list])
-        un.v_g_ci = confidenceInterval([traj.orbit.v_g for traj in traj_list], un.ci)
+        # Geocentric and heliocentric quantities exist only above the escape velocity, so they are
+        # skipped for low velocity objects (e.g. satellite re-entries) where ra_g is not computable
+        if all(traj.orbit.ra_g is not None for traj in traj_list):
 
-        # Meteor position in Sun-centred rectangular coordinates
-        meteor_pos_x = np.std([traj.orbit.meteor_pos[0] for traj in traj_list])
-        meteor_pos_x_ci = confidenceInterval([traj.orbit.meteor_pos[0] for traj in traj_list], un.ci)
-        meteor_pos_y = np.std([traj.orbit.meteor_pos[1] for traj in traj_list])
-        meteor_pos_y_ci = confidenceInterval([traj.orbit.meteor_pos[1] for traj in traj_list], un.ci)
-        meteor_pos_z = np.std([traj.orbit.meteor_pos[2] for traj in traj_list])
-        meteor_pos_z_ci = confidenceInterval([traj.orbit.meteor_pos[2] for traj in traj_list], un.ci)
+            # Geocentric
+            un.ra_g = scipy.stats.circstd([traj.orbit.ra_g for traj in traj_list])
+            un.ra_g_ci = confidenceInterval([traj.orbit.ra_g for traj in traj_list], un.ci, angle=True)
+            un.dec_g = np.std([traj.orbit.dec_g for traj in traj_list])
+            un.dec_g_ci = confidenceInterval([traj.orbit.dec_g for traj in traj_list], un.ci)
+            un.v_g = np.std([traj.orbit.v_g for traj in traj_list])
+            un.v_g_ci = confidenceInterval([traj.orbit.v_g for traj in traj_list], un.ci)
 
-        un.meteor_pos = np.array([meteor_pos_x, meteor_pos_y, meteor_pos_z])
-        un.meteor_pos_ci = np.array([meteor_pos_x_ci, meteor_pos_y_ci, meteor_pos_z_ci])
+            # Meteor position in Sun-centred rectangular coordinates
+            meteor_pos_x = np.std([traj.orbit.meteor_pos[0] for traj in traj_list])
+            meteor_pos_x_ci = confidenceInterval([traj.orbit.meteor_pos[0] for traj in traj_list], un.ci)
+            meteor_pos_y = np.std([traj.orbit.meteor_pos[1] for traj in traj_list])
+            meteor_pos_y_ci = confidenceInterval([traj.orbit.meteor_pos[1] for traj in traj_list], un.ci)
+            meteor_pos_z = np.std([traj.orbit.meteor_pos[2] for traj in traj_list])
+            meteor_pos_z_ci = confidenceInterval([traj.orbit.meteor_pos[2] for traj in traj_list], un.ci)
 
-        # Zenith angles
-        un.zc = np.std([traj.orbit.zc for traj in traj_list])
-        un.zc_ci = confidenceInterval([traj.orbit.zc for traj in traj_list], un.ci)
-        un.zg = np.std([traj.orbit.zg for traj in traj_list])
-        un.zg_ci = confidenceInterval([traj.orbit.zg for traj in traj_list], un.ci)
+            un.meteor_pos = np.array([meteor_pos_x, meteor_pos_y, meteor_pos_z])
+            un.meteor_pos_ci = np.array([meteor_pos_x_ci, meteor_pos_y_ci, meteor_pos_z_ci])
+
+            # Zenith angles
+            un.zc = np.std([traj.orbit.zc for traj in traj_list])
+            un.zc_ci = confidenceInterval([traj.orbit.zc for traj in traj_list], un.ci)
+            un.zg = np.std([traj.orbit.zg for traj in traj_list])
+            un.zg_ci = confidenceInterval([traj.orbit.zg for traj in traj_list], un.ci)
 
 
-        # Ecliptic geocentric
-        un.L_g = scipy.stats.circstd([traj.orbit.L_g for traj in traj_list])
-        un.L_g_ci = confidenceInterval([traj.orbit.L_g for traj in traj_list], un.ci, angle=True)
-        un.B_g = np.std([traj.orbit.B_g for traj in traj_list])
-        un.B_g_ci = confidenceInterval([traj.orbit.B_g for traj in traj_list], un.ci)
-        un.v_h = np.std([traj.orbit.v_h for traj in traj_list])
-        un.v_h_ci = confidenceInterval([traj.orbit.v_h for traj in traj_list], un.ci)
+            # Ecliptic geocentric
+            un.L_g = scipy.stats.circstd([traj.orbit.L_g for traj in traj_list])
+            un.L_g_ci = confidenceInterval([traj.orbit.L_g for traj in traj_list], un.ci, angle=True)
+            un.B_g = np.std([traj.orbit.B_g for traj in traj_list])
+            un.B_g_ci = confidenceInterval([traj.orbit.B_g for traj in traj_list], un.ci)
+            un.v_h = np.std([traj.orbit.v_h for traj in traj_list])
+            un.v_h_ci = confidenceInterval([traj.orbit.v_h for traj in traj_list], un.ci)
 
-        # Ecliptic heliocentric
-        un.L_h = scipy.stats.circstd([traj.orbit.L_h for traj in traj_list])
-        un.L_h_ci = confidenceInterval([traj.orbit.L_h for traj in traj_list], un.ci, angle=True)
-        un.B_h = np.std([traj.orbit.B_h for traj in traj_list])
-        un.B_h_ci = confidenceInterval([traj.orbit.B_h for traj in traj_list], un.ci)
-        un.v_h_x = np.std([traj.orbit.v_h_x for traj in traj_list])
-        un.v_h_x_ci = confidenceInterval([traj.orbit.v_h_x for traj in traj_list], un.ci)
-        un.v_h_y = np.std([traj.orbit.v_h_y for traj in traj_list])
-        un.v_h_y_ci = confidenceInterval([traj.orbit.v_h_y for traj in traj_list], un.ci)
-        un.v_h_z = np.std([traj.orbit.v_h_z for traj in traj_list])
-        un.v_h_z_ci = confidenceInterval([traj.orbit.v_h_z for traj in traj_list], un.ci)
+            # Ecliptic heliocentric
+            un.L_h = scipy.stats.circstd([traj.orbit.L_h for traj in traj_list])
+            un.L_h_ci = confidenceInterval([traj.orbit.L_h for traj in traj_list], un.ci, angle=True)
+            un.B_h = np.std([traj.orbit.B_h for traj in traj_list])
+            un.B_h_ci = confidenceInterval([traj.orbit.B_h for traj in traj_list], un.ci)
+            un.v_h_x = np.std([traj.orbit.v_h_x for traj in traj_list])
+            un.v_h_x_ci = confidenceInterval([traj.orbit.v_h_x for traj in traj_list], un.ci)
+            un.v_h_y = np.std([traj.orbit.v_h_y for traj in traj_list])
+            un.v_h_y_ci = confidenceInterval([traj.orbit.v_h_y for traj in traj_list], un.ci)
+            un.v_h_z = np.std([traj.orbit.v_h_z for traj in traj_list])
+            un.v_h_z_ci = confidenceInterval([traj.orbit.v_h_z for traj in traj_list], un.ci)
 
-        # Orbital elements
-        un.la_sun = scipy.stats.circstd([traj.orbit.la_sun for traj in traj_list])
-        un.la_sun_ci = confidenceInterval([traj.orbit.la_sun for traj in traj_list], un.ci, angle=True)
-        un.a = np.std([traj.orbit.a for traj in traj_list])
-        un.a_ci = confidenceInterval([traj.orbit.a for traj in traj_list], un.ci)
-        un.e = np.std([traj.orbit.e for traj in traj_list])
-        un.e_ci = confidenceInterval([traj.orbit.e for traj in traj_list], un.ci)
-        un.i = np.std([traj.orbit.i for traj in traj_list])
-        un.i_ci = confidenceInterval([traj.orbit.i for traj in traj_list], un.ci)
-        un.peri = scipy.stats.circstd([traj.orbit.peri for traj in traj_list])
-        un.peri_ci = confidenceInterval([traj.orbit.peri for traj in traj_list], un.ci, angle=True)
-        un.node = scipy.stats.circstd([traj.orbit.node for traj in traj_list])
-        un.node_ci = confidenceInterval([traj.orbit.node for traj in traj_list], un.ci, angle=True)
-        un.pi = scipy.stats.circstd([traj.orbit.pi for traj in traj_list])
-        un.pi_ci = confidenceInterval([traj.orbit.pi for traj in traj_list], un.ci, angle=True)
-        un.b = np.std([traj.orbit.b for traj in traj_list])
-        un.b_ci = confidenceInterval([traj.orbit.b for traj in traj_list], un.ci)
-        un.q = np.std([traj.orbit.q for traj in traj_list])
-        un.q_ci = confidenceInterval([traj.orbit.q for traj in traj_list], un.ci)
-        un.Q = np.std([traj.orbit.Q for traj in traj_list])
-        un.Q_ci = confidenceInterval([traj.orbit.Q for traj in traj_list], un.ci)
-        un.true_anomaly = scipy.stats.circstd([traj.orbit.true_anomaly for traj in traj_list])
-        un.true_anomaly_ci = confidenceInterval([traj.orbit.true_anomaly for traj in traj_list], un.ci, \
-            angle=True)
-        un.eccentric_anomaly = scipy.stats.circstd([traj.orbit.eccentric_anomaly for traj in traj_list])
-        un.eccentric_anomaly_ci = confidenceInterval([traj.orbit.eccentric_anomaly for traj in traj_list], \
-            un.ci, angle=True)
-        un.mean_anomaly = scipy.stats.circstd([traj.orbit.mean_anomaly for traj in traj_list])
-        un.mean_anomaly_ci = confidenceInterval([traj.orbit.mean_anomaly for traj in traj_list], un.ci, \
-            angle=True)
+            # Orbital elements
+            un.la_sun = scipy.stats.circstd([traj.orbit.la_sun for traj in traj_list])
+            un.la_sun_ci = confidenceInterval([traj.orbit.la_sun for traj in traj_list], un.ci, angle=True)
+            un.a = np.std([traj.orbit.a for traj in traj_list])
+            un.a_ci = confidenceInterval([traj.orbit.a for traj in traj_list], un.ci)
+            un.e = np.std([traj.orbit.e for traj in traj_list])
+            un.e_ci = confidenceInterval([traj.orbit.e for traj in traj_list], un.ci)
+            un.i = np.std([traj.orbit.i for traj in traj_list])
+            un.i_ci = confidenceInterval([traj.orbit.i for traj in traj_list], un.ci)
+            un.peri = scipy.stats.circstd([traj.orbit.peri for traj in traj_list])
+            un.peri_ci = confidenceInterval([traj.orbit.peri for traj in traj_list], un.ci, angle=True)
+            un.node = scipy.stats.circstd([traj.orbit.node for traj in traj_list])
+            un.node_ci = confidenceInterval([traj.orbit.node for traj in traj_list], un.ci, angle=True)
+            un.pi = scipy.stats.circstd([traj.orbit.pi for traj in traj_list])
+            un.pi_ci = confidenceInterval([traj.orbit.pi for traj in traj_list], un.ci, angle=True)
+            un.b = np.std([traj.orbit.b for traj in traj_list])
+            un.b_ci = confidenceInterval([traj.orbit.b for traj in traj_list], un.ci)
+            un.q = np.std([traj.orbit.q for traj in traj_list])
+            un.q_ci = confidenceInterval([traj.orbit.q for traj in traj_list], un.ci)
+            un.Q = np.std([traj.orbit.Q for traj in traj_list])
+            un.Q_ci = confidenceInterval([traj.orbit.Q for traj in traj_list], un.ci)
+            un.true_anomaly = scipy.stats.circstd([traj.orbit.true_anomaly for traj in traj_list])
+            un.true_anomaly_ci = confidenceInterval([traj.orbit.true_anomaly for traj in traj_list], un.ci, \
+                angle=True)
+            un.eccentric_anomaly = scipy.stats.circstd([traj.orbit.eccentric_anomaly for traj in traj_list])
+            un.eccentric_anomaly_ci = confidenceInterval([traj.orbit.eccentric_anomaly for traj in traj_list], \
+                un.ci, angle=True)
+            un.mean_anomaly = scipy.stats.circstd([traj.orbit.mean_anomaly for traj in traj_list])
+            un.mean_anomaly_ci = confidenceInterval([traj.orbit.mean_anomaly for traj in traj_list], un.ci, \
+                angle=True)
 
-        # Last perihelion uncertanty (days)
-        last_perihelion_list = [datetime2JD(traj.orbit.last_perihelion) for traj \
-            in traj_list if isinstance(traj.orbit.last_perihelion, datetime.datetime)]
-        if len(last_perihelion_list):
-            un.last_perihelion = np.std(last_perihelion_list)
-            un.last_perihelion_ci = confidenceInterval(last_perihelion_list, un.ci)
-        else:
-            un.last_perihelion = np.nan
-            un.last_perihelion_ci = (np.nan, np.nan)
+            # Last perihelion uncertanty (days)
+            last_perihelion_list = [datetime2JD(traj.orbit.last_perihelion) for traj \
+                in traj_list if isinstance(traj.orbit.last_perihelion, datetime.datetime)]
+            if len(last_perihelion_list):
+                un.last_perihelion = np.std(last_perihelion_list)
+                un.last_perihelion_ci = confidenceInterval(last_perihelion_list, un.ci)
+            else:
+                un.last_perihelion = np.nan
+                un.last_perihelion_ci = (np.nan, np.nan)
         
 
-        # Mean motion in the orbit (rad/day)
-        un.n = np.std([traj.orbit.n for traj in traj_list])
-        un.n_ci = confidenceInterval([traj.orbit.n for traj in traj_list], un.ci)
+            # Mean motion in the orbit (rad/day)
+            un.n = np.std([traj.orbit.n for traj in traj_list])
+            un.n_ci = confidenceInterval([traj.orbit.n for traj in traj_list], un.ci)
 
-        # Orbital period
-        un.T = np.std([traj.orbit.T for traj in traj_list])
-        un.T_ci = confidenceInterval([traj.orbit.T for traj in traj_list], un.ci)
+            # Orbital period
+            un.T = np.std([traj.orbit.T for traj in traj_list])
+            un.T_ci = confidenceInterval([traj.orbit.T for traj in traj_list], un.ci)
 
-        # Tisserand's parameter
-        un.Tj = np.std([traj.orbit.Tj for traj in traj_list])
-        un.Tj_ci = confidenceInterval([traj.orbit.Tj for traj in traj_list], un.ci)
+            # Tisserand's parameter
+            un.Tj = np.std([traj.orbit.Tj for traj in traj_list])
+            un.Tj_ci = confidenceInterval([traj.orbit.Tj for traj in traj_list], un.ci)
     
 
     return un
@@ -1929,7 +1934,7 @@ def trajNoiseGenerator(traj, noise_sigma):
 
 
 
-def checkMCTrajectories(mc_results, timing_res=np.inf, geometric_uncert=False):
+def checkMCTrajectories(mc_results, timing_res=np.inf, geometric_uncert=False, lowvel=False):
     """ Filter out MC computed trajectories and only return successful ones. 
     
     Arguments:
@@ -1940,6 +1945,8 @@ def checkMCTrajectories(mc_results, timing_res=np.inf, geometric_uncert=False):
         geometric_uncert: [bool] If True, all MC runs will be taken to estimate the uncertainty, not just
             the ones with the better cost function value than the pure geometric solution. Use this when
             the lag is not reliable.
+        lowvel: [bool] If True, keep solutions without a computable geocentric orbit (objects slower than
+            the escape velocity, e.g. satellite re-entries).
 
     Returns:
         [list] A filtered list of trajectories.
@@ -1957,9 +1964,11 @@ def checkMCTrajectories(mc_results, timing_res=np.inf, geometric_uncert=False):
     # Reject those solutions for which LoS angle minimization failed
     mc_results = [mc_traj for mc_traj in mc_results if mc_traj.los_mini_status == True]
 
-    # Reject those solutions for which the orbit could not be calculated
-    mc_results = [mc_traj for mc_traj in mc_results if (mc_traj.orbit.ra_g is not None) \
-        and (mc_traj.orbit.dec_g is not None)]
+    # Reject those solutions for which the orbit could not be calculated (below the escape velocity there is
+    # no geocentric orbit, so this check is skipped for low velocity objects)
+    if not lowvel:
+        mc_results = [mc_traj for mc_traj in mc_results if (mc_traj.orbit.ra_g is not None) \
+            and (mc_traj.orbit.dec_g is not None)]
 
     print("{:d} successful MC runs done...".format(len(mc_results)))
 
@@ -2043,7 +2052,9 @@ def monteCarloTrajectory(traj, mc_runs=None, mc_pick_multiplier=1, noise_sigma=1
 
     
     # Run the MC solutions
-    results_check_kwagrs = {"timing_res": traj.timing_res, "geometric_uncert": geometric_uncert}
+    lowvel = getattr(traj, "lowvel", False)
+    results_check_kwagrs = {"timing_res": traj.timing_res, "geometric_uncert": geometric_uncert,
+        "lowvel": lowvel}
     mc_results = parallelComputeGenerator(traj_generator, _MCTrajSolve, checkMCTrajectories, mc_runs, \
         results_check_kwagrs=results_check_kwagrs, n_proc=mc_cores, max_runs=max_runs)
 
@@ -2060,8 +2071,12 @@ def monteCarloTrajectory(traj, mc_runs=None, mc_pick_multiplier=1, noise_sigma=1
 
 
     # Add the original trajectory in the Monte Carlo results, if it is the one which has the best length match
-    if traj.orbit.ra_g is not None:
+    if (traj.orbit.ra_g is not None) or lowvel:
         mc_results.append(traj)
+
+    # Orbit-dependent statistics and plots need a geocentric orbit for every solution
+    orbits_ok = all((mc_traj.orbit is not None) and (mc_traj.orbit.ra_g is not None) \
+        for mc_traj in mc_results)
 
     
     ##########################################################################################################
@@ -2097,7 +2112,7 @@ def monteCarloTrajectory(traj, mc_runs=None, mc_pick_multiplier=1, noise_sigma=1
     ### PLOT RADIANT SPREAD (Vg color and length stddev) ###
     ##########################################################################################################
 
-    if (traj.orbit is not None) and plot_results:
+    if (traj.orbit is not None) and orbits_ok and plot_results:
 
         ra_g_list = np.array([traj_temp.orbit.ra_g for traj_temp in mc_results])
         dec_g_list = np.array([traj_temp.orbit.dec_g for traj_temp in mc_results])
@@ -2183,7 +2198,7 @@ def monteCarloTrajectory(traj, mc_runs=None, mc_pick_multiplier=1, noise_sigma=1
     ### PLOT ORBITAL ELEMENTS SPREAD ###
     ##########################################################################################################
 
-    if (traj.orbit is not None) and plot_results:
+    if (traj.orbit is not None) and orbits_ok and plot_results:
 
         a_list = np.array([traj_temp.orbit.a for traj_temp in mc_results])
         incl_list = np.array([traj_temp.orbit.i for traj_temp in mc_results])

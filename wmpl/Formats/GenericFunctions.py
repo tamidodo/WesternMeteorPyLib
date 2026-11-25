@@ -459,4 +459,8 @@ def addSolverOptions(arg_parser, skip_velpart=False):
     arg_parser.add_argument('-o', '--enableOSM', 
         help="Enable OSM based groung plots. Internet connection required.", action="store_true")
 
+    arg_parser.add_argument('--lowvel', \
+        help="Low velocity object (e.g. satellite re-entry, below escape velocity): keep solutions and " \
+        "Monte Carlo runs without a computable geocentric orbit.", action="store_true")
+
     return arg_parser
