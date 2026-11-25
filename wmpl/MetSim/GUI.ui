@@ -1203,6 +1203,25 @@
       <string>Vinit sim = ?</string>
      </property>
     </widget>
+    <widget class="QCheckBox" name="checkBoxLagTimeOffset">
+     <property name="geometry">
+      <rect>
+       <x>450</x>
+       <y>527</y>
+       <width>181</width>
+       <height>21</height>
+      </rect>
+     </property>
+     <property name="toolTip">
+      <string>Fit the time at which the simulation passes the height of the first observed point, instead of fixing it to the time of that point</string>
+     </property>
+     <property name="text">
+      <string>Fit time offset t0</string>
+     </property>
+     <property name="checked">
+      <bool>true</bool>
+     </property>
+    </widget>
    </widget>
    <widget class="QGroupBox" name="meteoroidGroup">
     <property name="geometry">
@@ -1591,6 +1610,11 @@
      <item>
       <property name="text">
        <string>Borovicka et al. (2020)</string>
+      </property>
+     </item>
+     <item>
+      <property name="text">
+       <string>Pecina &amp; Ceplecha (1983)</string>
       </property>
      </item>
     </widget>
@@ -2590,7 +2614,7 @@ LCs</string>
      <x>0</x>
      <y>0</y>
      <width>1910</width>
-     <height>20</height>
+     <height>22</height>
     </rect>
    </property>
   </widget>

@@ -1,4 +1,4 @@
-""" Loading and hadling Mirfit *.met files. """
+""" Loading and handling Mirfit *.met files. """
 
 from __future__ import print_function, absolute_import, division
 
@@ -561,7 +561,7 @@ def loadMet(dir_path, file_name, photom_dict=None):
                     scale.sx, scale.sy, scale.phi, scale.tx, scale.ty, scale.wid, scale.ht = scale_data[:7]
                     scale.site = site
 
-                    # Init the converson matrix
+                    # Init the conversion matrix
                     scale.initM()
 
                     met.scale_plates[site] = scale
@@ -588,7 +588,7 @@ def loadMet(dir_path, file_name, photom_dict=None):
                     exact.a, exact.da, exact.b, exact.db, exact.c, exact.dc, exact.d, exact.dd = exact_fit
                     exact.site = site
 
-                    # Init the converson matrix
+                    # Init the conversion matrix
                     exact.initM()
                     
                     met.exact_plates[site] = exact
@@ -891,6 +891,7 @@ if __name__ == "__main__":
     solveTrajectoryMet(met, solver=cml_args.solver, max_toffset=max_toffset, \
             monte_carlo=(not cml_args.disablemc), mc_runs=cml_args.mcruns, \
             geometric_uncert=cml_args.uncertgeom, gravity_correction=(not cml_args.disablegravity), 
+            air_rotation=(not cml_args.disableairrot), \
             plot_all_spatial_residuals=cml_args.plotallspatial, plot_file_type=cml_args.imgformat, \
             show_plots=(not cml_args.hideplots), v_init_part=velpart, v_init_ht=vinitht, \
             show_jacchia=cml_args.jacchia, 

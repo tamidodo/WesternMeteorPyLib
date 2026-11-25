@@ -13,9 +13,9 @@ import matplotlib.pyplot as plt
 import scipy.interpolate
 
 from wmpl.MetSim.GUI import SimulationResults
-from wmpl.MetSim.MetSimErosion import Constants
+from wmpl.MetSim.MetSimErosion import Constants, Fragment
 from wmpl.MetSim.MetSimErosion import runSimulation as runSimulationErosion
-from wmpl.Utils.AtmosphereDensity import fitAtmPoly
+from wmpl.Utils.AtmosphereDensity import fitAtmPoly, addAtmosphereArguments, setAtmosphere
 from wmpl.Utils.Math import padOrTruncate
 from wmpl.Utils.OSTools import mkdirP
 from wmpl.Utils.TrajConversions import J2000_JD
@@ -91,7 +91,7 @@ class ErosionSimParametersCAMO(object):
         # System FPS
         self.fps = 80
 
-        # Time lag of length measurements (range in seconds) - accomodate CAMO tracking delay of 8 frames
+        # Time lag of length measurements (range in seconds) - accommodate CAMO tracking delay of 8 frames
         #   This should be 0 for all other systems except for the CAMO mirror tracking system
         self.len_delay_min = 8.0/self.fps
         self.len_delay_max = 15.0/self.fps
@@ -240,7 +240,7 @@ class ErosionSimParametersCAMOWide(object):
         # System FPS
         self.fps = 80
 
-        # Time lag of length measurements (range in seconds) - accomodate CAMO tracking delay of 8 frames
+        # Time lag of length measurements (range in seconds) - accommodate CAMO tracking delay of 8 frames
         #   This should be 0 for all other systems except for the CAMO mirror tracking system
         self.len_delay_min = 0
         self.len_delay_max = 0
@@ -390,6 +390,9 @@ class ErosionSimContainer(object):
         # Init simulation constants
         self.const = Constants()
         self.const.dens_co = self.params.dens_co
+
+        # Use the polynomial atmosphere, on which the pretrained networks were trained
+        self.const.atm_density_model = 'polynomial'
         self.const.P_0M = self.params.P_0M
 
         # Set tau to CAMO faint meteor model
@@ -432,14 +435,14 @@ class ErosionSimContainer(object):
                 # Use a sampling mass index of 2
                 p.val = samplePowerLaw(-2.0, p.min, p.max)
 
-            # b) Distribute all other values uniformely
+            # b) Distribute all other values uniformly
             else:
 
                 # Randomly generate the parameter value using an uniform distribution (and the given seed)
                 p.val = local_state.uniform(p.min, p.max)
 
 
-            # Assign value to simulation contants
+            # Assign value to simulation constants
             setattr(self.const, param_name, p.val)
 
 
@@ -477,7 +480,7 @@ class ErosionSimContainer(object):
 
 
     def denormalizeInputs(self):
-        """ Rescale input parametrs to physical values. """
+        """ Rescale input parameters to physical values. """
 
         pass
 
@@ -522,8 +525,10 @@ class ErosionSimContainer(object):
 
 
         file_path = os.path.join(output_dir, self.file_name + ".json")
+        # Save the fragments with all their attributes, most of which are not in their __dict__
         with open(file_path, 'w') as f:
-            json.dump(self2, f, default=lambda o: o.__dict__, indent=4)
+            json.dump(self2, f, default=lambda o: o.toDict() if isinstance(o, Fragment) else o.__dict__, \
+                indent=4)
 
         print("Saved fit parameters to:", file_path)
 
@@ -626,7 +631,7 @@ def extractSimData(sim, min_frames_visible=MIN_FRAMES_VISIBLE, check_only=False,
 
     Keyword arguments:
         min_frames_visible: [int] Minimum number of frames above the limiting magnitude
-        check_only: [bool] Only check if the simulation satisfies filters, don' compute eveything.
+        check_only: [bool] Only check if the simulation satisfies filters, don' compute everything.
             Speed up the evaluation. False by default.
         param_class: [object] Override the simulation parameters object with the given instance.
         param_class_name: [str] Override the simulation parameters object with an instance of the given
@@ -692,7 +697,7 @@ def extractSimData(sim, min_frames_visible=MIN_FRAMES_VISIBLE, check_only=False,
     if not np.any(indices_visible):
         return None
 
-    ### CHECK METEOR VISIBILITY WITH THE BRIGTHER (DETECTION) LIMITING MAGNITUDE ###
+    ### CHECK METEOR VISIBILITY WITH THE BRIGHTER (DETECTION) LIMITING MAGNITUDE ###
     ###     (in the CAMO widefield camera)                                       ###
 
     # Get indices of magnitudes above the brighter limiting magnitude
@@ -882,7 +887,7 @@ def saveProcessedList(data_path, results_list, param_class_name, min_frames_visi
         results_list: [list] A list of pickle files which passes the filers, plus randomly drawn parameters 
             such as the limiting magnitude. If the pickle file didn't pass the filter, None is the entry.
         param_class_name: [str] Name of the parameter class used for postprocessing.
-        min_frame_visible: [int] Minimum number of frames above the limting magnitude.
+        min_frame_visible: [int] Minimum number of frames above the limiting magnitude.
 
     """
 
@@ -955,8 +960,14 @@ if __name__ == "__main__":
     arg_parser.add_argument('--cores', metavar='CORES', type=int, default=None, \
         help="Number of cores to use. All by default.")
 
+    # Add the atmosphere model options
+    addAtmosphereArguments(arg_parser)
+
     # Parse the command line arguments
     cml_args = arg_parser.parse_args()
+
+    # Apply the atmosphere model options
+    setAtmosphere(cml_args)
 
     #########################
 

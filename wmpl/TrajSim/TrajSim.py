@@ -25,7 +25,7 @@ def geocentricRadiantToApparent(ra_g, dec_g, v_g, state_vector, jd_ref):
         ra_g: [float] Geocentric right ascension (radians).
         dec_g: [float] Geocentric declination (radians).
         v_g: [float] Geocentric velocity (m/s).
-        state_vector: [ndarray of 3 elemens] (x, y, z) ECI coordinates of the initial state vector (meters).
+        state_vector: [ndarray of 3 elements] (x, y, z) ECI coordinates of the initial state vector (meters).
         jd_ref: [float] reference Julian date of the event.
 
     Return:
@@ -54,7 +54,7 @@ def geocentricRadiantToApparent(ra_g, dec_g, v_g, state_vector, jd_ref):
 
 
     # Assume that the velocity at infinity corresponds to the initial velocity
-    v_init = np.sqrt(v_g**2 + (2*6.67408*5.9722)*1e13/vectMag(state_vector))
+    v_init = np.sqrt(v_g**2 + (2*6.67408*5.9722)*1e13/vectMag(np.array(state_vector, dtype=np.float64)))
 
     # Numerically find the apparent radiant
     res = scipy.optimize.minimize(_radiantDiff, x0=[ra_g, dec_g], args=(ra_g, dec_g, v_init, state_vector, jd_ref), \
@@ -111,7 +111,7 @@ if __name__ == "__main__":
     # Geocentric velocity in m/s
     v_g = 32.80401*1000
 
-    # ECI coordinates of the inital state vector
+    # ECI coordinates of the initial state vector
     state_vector = np.array([4663824.46, 417867.46, 4458026.80])
 
     # reference Julian date

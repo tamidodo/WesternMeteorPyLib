@@ -5,16 +5,40 @@ import scipy.optimize
 import matplotlib.pyplot as plt
 from matplotlib.pyplot import cm
 
-from wmpl.Utils.AtmosphereDensity import fitAtmPoly
-from wmpl.Utils.Math import lineFunc
-from wmpl.Utils.TrajConversions import cartesian2Geo
-from wmpl.Utils.Physics import dynamicMass
+from wmpl.Utils.AtmosphereDensity import fitAtmPoly, addAtmosphereArguments, setAtmosphere
+from wmpl.Utils.AtmosphereDensity import loadAtmosphereProfile, atmDensTable, msisModelName
+from wmpl.Utils.Math import lineFunc, vectMag, rotateVector
+from wmpl.Utils.TrajConversions import cartesian2Geo, derotatedRadiantAltAz
+from wmpl.Utils.Physics import GAMMA_A, dynamicMass, groundSpeed, earthRotationVelocity, EARTH_ROTATION_RATE
 from wmpl.Utils.Pickling import loadPickle
-from wmpl.MetSim.MetSimErosion import Constants, runSimulation
+from wmpl.MetSim.MetSimErosion import Constants, runSimulation, G0
 from wmpl.MetSim.GUI import SimulationResults
+from wmpl.Trajectory.Trajectory import applyGravityDrop, gravityDropOrigin, gravityDropVectors, \
+    solutionDropTimeOrigin
 
 
-def runFragSim(mass, density, lat, lon, jd, ht_beg, v_init, entry_angle, gamma_a):
+def runFragSim(mass, density, lat, lon, jd, ht_beg, v_init, entry_angle, gamma_a, atm_table=None):
+    """ Simulate a single-body fragment from the given point until it slows to 3 km/s or reaches 15 km.
+
+    Arguments:
+        mass: [float] Initial mass (kg).
+        density: [float] Bulk density of the meteoroid (kg/m^3).
+        lat: [float] Latitude of the starting point (deg).
+        lon: [float] Longitude of the starting point (deg).
+        jd: [float] Julian date of the starting point.
+        ht_beg: [float] Starting height (m).
+        v_init: [float] Starting speed (m/s).
+        entry_angle: [float] Entry angle above the horizon (deg).
+        gamma_a: [float] Product of the drag coefficient and the shape factor of the dynamic mass. Not used
+            by the simulation, which keeps its own.
+
+    Keyword arguments:
+        atm_table: [tuple] Air density table (table_ht, table_log10_rho) of an atmosphere profile (see
+            loadAtmosphereProfile()). None by default (MSIS model).
+
+    Return:
+        sr: [SimulationResults] Results of the simulation.
+    """
 
     # Init simulation constants
     const = Constants()
@@ -23,17 +47,20 @@ def runFragSim(mass, density, lat, lon, jd, ht_beg, v_init, entry_angle, gamma_a
     # Set minimum simulation height
     const.h_kill = 15000 # m 
 
-    # Set minimum simuation speed
+    # Set minimum simulation speed
     const.v_kill = 3000 # m/s
 
 
-    # Set meteoroid parametrs
+    # Set meteoroid parameters
     const.m_init = mass
     const.v_init = v_init
     const.h_init = ht_beg
     const.rho = density
     #const.gamma = 1.0
     #const.shape_factor = 1.21
+
+    # Gamma*A is fixed on purpose, not taken from gamma_a: with the same Gamma*A as the dynamic mass, the
+    #   simulated velocity and path would not depend on gamma_a at all (only the mass scales as Gamma*A^3)
     const.shape_factor = 1.21
     const.gamma = 0.7
     
@@ -56,10 +83,24 @@ def runFragSim(mass, density, lat, lon, jd, ht_beg, v_init, entry_angle, gamma_a
     
 
 
-    # Fit the atmosphere density polynomial using NRLMSISE
-    ht_min = const.h_kill
-    ht_max = 180000
-    const.dens_co = fitAtmPoly(lat, lon, ht_min, ht_max, jd)
+    # Take the air density from the atmosphere profile if one is given
+    if atm_table is not None:
+
+        # Check that the profile covers the simulated heights, so the table is not extrapolated
+        if (ht_beg > atm_table[0][-1]) or (const.h_kill < atm_table[0][0]):
+            raise ValueError("The atmosphere profile ({:.1f} to {:.1f} km) does not cover the simulated " \
+                "heights ({:.1f} to {:.1f} km)".format(atm_table[0][0]/1000, atm_table[0][-1]/1000, \
+                const.h_kill/1000, ht_beg/1000))
+
+        const.atm_table_ht, const.atm_table_log10_rho = atm_table
+
+    else:
+
+        # Fit the atmosphere density polynomial using the MSIS model. The location is given in degrees,
+        #   while fitAtmPoly() takes it in radians. The simulation only descends from its starting height, and
+        #   a 7th order polynomial fitted up to 180 km misses the stratosphere by 10-30%, so it is fitted
+        #   below the starting height only
+        const.dens_co = fitAtmPoly(np.radians(lat), np.radians(lon), const.h_kill, ht_beg, jd)
 
     # Run the simulation
     frag_main, results_list, wake_results = runSimulation(const)
@@ -176,7 +217,91 @@ def interpolateHtVsTimeLen(traj, sample_step=0.1, show_plots=False):
 
 
 
-def computeFragEndParams(traj, dyn_mass, density, hend, vend, gamma_a):
+def pointOnTrajectory(traj, length, t, air_rotation=None):
+    """ Compute the ECI coordinates of a point on the fitted trajectory, including the gravity drop.
+
+        The point lies at the given length from the state vector along the radiant, displaced by the gravity
+        drop the solver models from the fitted line, across the path (see Trajectory.gravityDropTable).
+        Solutions without the speeds for it were dropped vertically (see Trajectory.applyGravityDrop), of
+        which only the component perpendicular to the line is applied, as the length absorbed the rest.
+
+    Arguments:
+        traj: [Trajectory] Solved trajectory.
+        length: [float] Length from the state vector along the trajectory (m), positive towards the end.
+        t: [float] Time of the point relative to the trajectory reference time (s).
+
+    Keyword arguments:
+        air_rotation: [bool] Take the drag against the rotating air into account in the drop. None by default,
+            in which case the setting of the solution is used.
+
+    Return:
+        [ndarray] ECI coordinates of the point (m).
+    """
+
+    if air_rotation is None:
+        air_rotation = getattr(traj, 'air_rotation', False)
+
+    P = traj.state_vect_mini - length*traj.radiant_eci_mini
+
+    # Solutions without the gravity correction have a straight fitted line and nothing to add
+    if getattr(traj, 'gravity_correction', True):
+
+        # Take the time from which the solver computed the drop
+        t0 = solutionDropTimeOrigin(traj)
+
+        # Drop the point across the path with the speeds of the solution
+        if getattr(traj, 'gravity_vel', None) is not None:
+            eci0 = gravityDropOrigin(traj.observations, traj.state_vect_mini, traj.radiant_eci_mini, \
+                traj.gravity_vel, t0)
+            P = P + gravityDropVectors(eci0, traj.radiant_eci_mini, [t - t0], traj.gravity_vel, t0, \
+                getattr(traj, 'gravity_factor', 1.0), air_rotation=air_rotation)[0]
+
+        else:
+
+            drop = applyGravityDrop(P, t - t0, vectMag(traj.state_vect_mini), \
+                getattr(traj, 'gravity_factor', 1.0), getattr(traj, 'v0z', None) or 0.0) - P
+
+            # Keep only the component perpendicular to the fitted line
+            P = P + drop - np.dot(drop, traj.radiant_eci_mini)*traj.radiant_eci_mini
+
+    return P
+
+
+def computeFragEndParams(traj, dyn_mass, density, hend, vend, gamma_a, atm_table=None):
+    """ Propagate a fragment of the given dynamic mass from the evaluation point down to 3 km/s with the
+        single-body ablation model, and compute where and in which direction it ends.
+
+        The returned final azimuth and elevation are those of the apparent ground-fixed radiant (epoch of
+        date), as traj.orbit.azimuth_apparent_norot and elevation_apparent_norot, evaluated at the final point
+        and with the elevation steepened by the gravity turn along the path. They are the inputs a dark
+        flight computation needs.
+
+        The simulation works relative to the ground, so the body moves by the simulated length along the
+        ground-fixed direction of motion, and with the ground under it in the ECI frame.
+
+    Arguments:
+        traj: [Trajectory] Solved trajectory.
+        dyn_mass: [float] Dynamic mass at the evaluation point (kg).
+        density: [float] Bulk density of the meteoroid (kg/m^3).
+        hend: [float] Height of the evaluation point (m).
+        vend: [float] Speed relative to the ground at the evaluation point (m/s), see groundSpeed().
+        gamma_a: [float] Product of the drag coefficient and the shape factor used for the dynamic mass. Not
+            used by the simulation itself, see runFragSim().
+
+    Keyword arguments:
+        atm_table: [tuple] Air density table (table_ht, table_log10_rho) of an atmosphere profile (see
+            loadAtmosphereProfile()). None by default (MSIS model).
+
+    Return:
+        (sr, final_mass, final_lat, final_lon, final_ele, final_azim, final_elev): [tuple]
+            sr: [SimulationResults] Results of the fragment simulation.
+            final_mass: [float] Mass at the final point (kg).
+            final_lat: [float] Latitude of the final point (deg, +N).
+            final_lon: [float] Longitude of the final point (deg, +E).
+            final_ele: [float] Height of the final point (km).
+            final_azim: [float] Azimuth of the ground-fixed radiant at the final point (deg, +E of due N).
+            final_elev: [float] Elevation of the ground-fixed radiant at the final point (deg).
+    """
 
     jd = traj.jdt_ref
     lat = np.degrees(traj.rend_lat)
@@ -185,7 +310,7 @@ def computeFragEndParams(traj, dyn_mass, density, hend, vend, gamma_a):
     entry_angle = np.degrees(traj.orbit.elevation_apparent_norot)
 
     # Fit an interpolation function from time to height
-    ht_vs_time_interp, ht_vs_len_interp = interpolateHtVsTimeLen(traj, sample_step=0.1, show_plots=False)
+    ht_vs_time_interp, _ = interpolateHtVsTimeLen(traj, sample_step=0.1, show_plots=False)
 
     # # Compute the dynamic mass (upper range)
     # dyn_mass = dynamicMass(density, np.radians(lat), np.radians(lon), hend, jd, vend, decel, \
@@ -196,13 +321,20 @@ def computeFragEndParams(traj, dyn_mass, density, hend, vend, gamma_a):
     # print("  dyn mass   = {:.3f} kg".format(dyn_mass))
 
 
-    # Get the time and length at the observed point
+    # Get the time at the observed point, and its length from the trajectory geometry. Interpolating the
+    #   length instead mixes the smoothed heights with the raw lengths, which at shallow entry angles turns
+    #   a small height difference into a large length difference
     meas_time = ht_vs_time_interp(hend)
-    meas_len  = ht_vs_len_interp(hend)
+
+    # The height along the line falls from the state vector until the point nearest the Earth's centre, at
+    #   a length of state_vect.radiant, which brackets the root
+    meas_len = scipy.optimize.brentq(lambda l: cartesian2Geo(traj.jdt_ref + meas_time/86400, \
+        *pointOnTrajectory(traj, l, meas_time))[2] - hend, 0, \
+        np.dot(traj.state_vect_mini, traj.radiant_eci_mini))
     
 
     # Run the simulation until ablation stops
-    sr = runFragSim(dyn_mass, density, lat, lon, jd, hend, vend, entry_angle, gamma_a)
+    sr = runFragSim(dyn_mass, density, lat, lon, jd, hend, vend, entry_angle, gamma_a, atm_table=atm_table)
 
     # Extract the final height
     final_ht = 0
@@ -219,14 +351,50 @@ def computeFragEndParams(traj, dyn_mass, density, hend, vend, gamma_a):
 
     ### Compute the final lat/lon ###
 
-    # Initial 3D ECI vector + total length x direction
-    final_eci = traj.state_vect_mini - total_len*traj.radiant_eci_mini
+    # Take the ground-fixed direction of motion at the evaluation point
+    direction_ground = -traj.v_init*traj.radiant_eci_mini \
+        - earthRotationVelocity(pointOnTrajectory(traj, meas_len, meas_time))
+    direction_ground /= vectMag(direction_ground)
+
+    # Add the gravity drop from the evaluation time to the final time without the rotating air, as the
+    #   rotation of the ground below already carries the point with the air
+    drop_eci = pointOnTrajectory(traj, meas_len, meas_time) \
+        + pointOnTrajectory(traj, meas_len, total_time, air_rotation=False) \
+        - pointOnTrajectory(traj, meas_len, meas_time, air_rotation=False)
+
+    # Move the simulated length along it with the gravity drop at the final time, and rotate the point with
+    #   the ground to the final time
+    final_eci = rotateVector(drop_eci + sr.frag_main.length*direction_ground, np.array([0.0, 0.0, 1.0]), \
+        EARTH_ROTATION_RATE*final_time)
+
+    t_obs = np.concatenate([obs.time_data for obs in traj.observations])
 
     # Compute exact time of the end
     final_jd = jd + total_time/86400
 
-    # Compute the geo coordiantes
+    # Compute the geo coordinates
     final_lat, final_lon, final_ele = cartesian2Geo(final_jd, *final_eci)
+
+    ###
+
+
+    ### Compute the final ground-fixed azimuth and elevation (as in Orbit.calcOrbit) ###
+
+    # Derotate the fitted radiant at the final point. The radiant is the tangent of the path at its beginning
+    #   (the solver models gravity as a drop from that line), so it is derotated with the initial velocity, as
+    #   Orbit.calcOrbit does. Drag does not rotate the direction of motion relative to the air, so this
+    #   ground-fixed direction holds along the path up to the gravity turn added below.
+    final_azim, final_elev, _ = derotatedRadiantAltAz(traj.v_init*traj.radiant_eci_mini, final_eci, \
+        final_jd, final_lat, final_lon)
+
+    # Steepen the elevation by the gravity turn along the path, d(elev)/dt = g*cos(elev)/v, using the average
+    #   speed over the observed part and the simulated speeds after it. The turn starts where the fitted radiant
+    #   is tangent to the path: its beginning if the solver modelled the gravity drop, otherwise about its middle
+    t_turn = 0.0 if getattr(traj, 'gravity_correction', True) else (np.min(t_obs) + np.max(t_obs))/2
+    v_sim = sr.main_vel_arr[1:]
+    g_final = G0/(1 + final_ele/sr.const.r_earth)**2
+    final_elev += g_final*np.cos(final_elev)*((meas_time - t_turn)/traj.orbit.v_avg_norot \
+        + np.sum(np.diff(sr.time_arr)[v_sim > 0]/v_sim[v_sim > 0]))
 
     ###
 
@@ -240,9 +408,128 @@ def computeFragEndParams(traj, dyn_mass, density, hend, vend, gamma_a):
     print("  final lat      = {:.5f} deg".format(np.degrees(final_lat)))
     print("  final lon      = {:.5f} deg".format(np.degrees(final_lon)))
     print("  final ht       = {:.3f} km".format(final_ele/1000))
+    print("  final azim     = {:.5f} deg".format(np.degrees(final_azim)))
+    print("  final elev     = {:.5f} deg".format(np.degrees(final_elev)))
 
 
-    return sr, sr.frag_main.m, np.degrees(final_lat), np.degrees(final_lon), final_ele/1000
+    return sr, sr.frag_main.m, np.degrees(final_lat), np.degrees(final_lon), final_ele/1000, \
+        np.degrees(final_azim), np.degrees(final_elev)
+
+
+
+def _robust_linear_fit(x, y, p0=(1.0, 1.0), loss='soft_l1', **kwargs):
+    """ Fit a linear model y = m*x + c using robust least-squares optimization.
+        Covariance is estimated from the linear model Jacobian and the robust (MAD) residual variance.
+
+    Arguments:
+        x: [ndarray] Independent variable.
+        y: [ndarray] Dependent variable.
+        p0: [tuple(float, float)] Initial guess for slope and intercept.
+        loss: [str] Loss function for robust fitting (passed to least_squares).
+        **kwargs: Additional arguments passed to least_squares (e.g. f_scale).
+
+    Return:
+        popt: [ndarray] Optimal parameters [m, c].
+        pcov: [ndarray] 2x2 covariance matrix of the fit.
+        perr: [ndarray] Standard deviations of parameters [sigma_m, sigma_c].
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    def residualFunc(params, xx, yy):
+        m, c = params
+        return yy - lineFunc(xx, m, c)
+
+    res = scipy.optimize.least_squares(
+        residualFunc, p0, args=(x, y), loss=loss, jac='2-point', **kwargs
+    )
+    if not res.success:
+        raise RuntimeError("least_squares did not find a solution: " + res.message)
+
+    popt = res.x
+
+    # Use the Jacobian of the linear model, not res.jac, which is reweighted by the robust loss
+    J = np.column_stack((x, np.ones_like(x)))
+
+    # The normal matrix is singular when all points share the same time, in which case no slope is defined
+    if np.ptp(x) == 0:
+        raise RuntimeError("All points have the same time; the velocity slope and its covariance are "
+            "undefined.")
+
+    pcov = np.linalg.inv(J.T @ J)
+
+    r_raw = y - lineFunc(x, *popt)
+
+    # Use robust variance estimation (MAD), or the standard deviation if MAD is zero
+    mad = np.median(np.abs(r_raw - np.median(r_raw)))
+    resid_std = 1.4826*mad if mad > 0 else np.std(r_raw, ddof=1)
+
+    s_sq = resid_std**2
+    pcov = pcov*s_sq
+
+    perr = np.sqrt(np.diag(pcov))
+    
+    return popt, pcov, perr
+
+
+def fitVelocity(time_data, vel_data, p0=None, loss='soft_l1', sigma_clip=3.0):
+    """ Perform a robust velocity fit and iterative outlier rejection.
+        Uses robust least-squares (soft L1 loss) both before and after sigma-clipping.
+
+    Arguments:
+        time_data: [ndarray] Time data points.
+        vel_data: [ndarray] Velocity data points.
+        p0: [tuple(float, float)] Initial parameter guess (slope, intercept). None by default, for the
+            least-squares line.
+        loss: [str] Loss function for robust fitting.
+        sigma_clip: [float] Outlier rejection threshold, in units of the robust (MAD) residual standard
+            deviation.
+
+    Return:
+        popt: [ndarray] Final optimal parameters [m, c].
+        pcov: [ndarray] 2x2 covariance matrix of the final fit.
+        perr: [ndarray] Standard deviations of parameters [sigma_m, sigma_c].
+        mask: [ndarray(bool)] Boolean mask of inlier points used in final fit.
+    """
+
+    # Initial robust fit
+    # Start from the least-squares line, as the robust fit from a distant guess can run out of evaluations
+    if p0 is None:
+        p0 = np.polyfit(time_data, vel_data, 1)
+
+    popt, pcov, perr = _robust_linear_fit(time_data, vel_data, p0=p0, loss=loss)
+
+    yhat = lineFunc(np.asarray(time_data, dtype=float), *popt)
+    resid = np.asarray(vel_data, dtype=float) - yhat
+
+    # Compute robust std dev of residuals using MAD
+    mad = np.median(np.abs(resid - np.median(resid)))
+    resid_std = 1.4826*mad if mad > 0 else np.std(resid, ddof=1)
+    if not np.isfinite(resid_std) or resid_std == 0:
+        resid_std = np.finfo(float).eps
+
+    # Outlier rejection - Create mask for points within sigma_clip * resid_std
+    mask = np.abs(resid) < sigma_clip*resid_std
+
+    print("Outlier rejection: kept {}/{} points.".format(np.count_nonzero(mask), len(mask)))
+    print("Residual std dev: {:.3f}".format(resid_std))
+    print(mask)
+    print("Residuals:", resid)
+
+    if np.count_nonzero(mask) < 2:
+        return popt, pcov, perr, np.ones_like(mask, dtype=bool)
+
+    # Final robust fit on clipped data
+    popt2, pcov2, perr2 = _robust_linear_fit(
+        np.asarray(time_data)[mask],
+        np.asarray(vel_data)[mask],
+        p0=popt,
+        loss=loss,
+        f_scale=resid_std
+    )
+
+    return popt2, pcov2, perr2, mask
+
 
 
 if __name__ == "__main__":
@@ -270,23 +557,36 @@ if __name__ == "__main__":
         type=float, default=3500)
 
     arg_parser.add_argument('-g', '--ga', metavar='GAMMA_A', \
-        help='The product of the drag coefficient Gamma and the shape coefficient A. Used for computing the dynamic mass. Default is 0.55.', \
-        type=float, default=0.55)
+        help='The product of the drag coefficient Gamma and the shape coefficient A. Used for computing the dynamic mass. Default is {:.2f}.'.format(GAMMA_A), \
+        type=float, default=GAMMA_A)
 
     arg_parser.add_argument('-e', '--eval', metavar='EVAL_PT', \
         help='Point where to evaluate the dynamic mass (0 = ht_min, 1 = ht_max). Default is 0.5.', \
         type=float, default=0.5)
     
+    arg_parser.add_argument('--sigma_clip', metavar='SIGMA_CLIP', \
+        help='Sigma threshold for outlier rejection in the velocity fit. Default is 3.0.', \
+        type=float, default=3.0)
+    
     arg_parser.add_argument('--maxvel', metavar='MAX_VEL', \
-        help='Maximum velocity in km/s to consider in the height window. Used to remove outliers. No filter by default.', \
+        help='Maximum velocity in km/s to consider in the height window. Used to remove outliers. Default and upper limit is 73 km/s.', \
         type=float, default=None)
     
     arg_parser.add_argument('--maxmass', metavar='MAX_MASS', \
                             help='Maximum mass in kg for the dynamic mass measurements. Used to avoid inf values. Default is 50 kg.', \
                             type=float, default=50)
 
+    arg_parser.add_argument('--atm_profile', metavar='PROFILE_PATH', type=str, default=None, \
+        help='Take the air density from an atmosphere profile instead of the MSIS model, e.g. the ERA5 profile of the event that OpenDarkflight downloads. It is a CSV file in the format OpenDarkflight writes for model profiles (its wrf type), of which the height (m) and density (kg/m^3) columns are used. The winds are not used.')
+
+    # Add the atmosphere model options
+    addAtmosphereArguments(arg_parser)
+
     # Parse the command line arguments
     cml_args = arg_parser.parse_args()
+
+    # Apply the atmosphere model options
+    setAtmosphere(cml_args)
 
     #########################
 
@@ -310,13 +610,18 @@ if __name__ == "__main__":
         max_vel = 73_000
     
 
+    # Load the air density table of the atmosphere profile, if given
+    atm_table = None
+    if cml_args.atm_profile is not None:
+        atm_table = loadAtmosphereProfile(cml_args.atm_profile)
+
     # Load the trajectory
     traj = loadPickle(*os.path.split(os.path.abspath(cml_args.traj_path)))
 
     dir_path = os.path.dirname(cml_args.traj_path)
 
 
-    # Top height (if nagative, e.g. -3, the last 3 km from the bottom will be taken)
+    # Top height (if negative, e.g. -3, the last 3 km from the bottom will be taken)
     if cml_args.ht_max < 0:
         ht_max = traj.rend_ele/1000 - cml_args.ht_max
     else:
@@ -352,12 +657,13 @@ if __name__ == "__main__":
         ignored = obs.ignore_list[1:] > 0
 
 
-        vel = obs.velocities[1:][~ignored]
+        # Speeds relative to the ground, which the drag depends on, from the solver's ECI speeds
+        vel = groundSpeed(traj, obs.model_eci[1:][~ignored], obs.velocities[1:][~ignored])
         ht = obs.meas_ht[1:][~ignored]
         t = obs.time_data[1:][~ignored]
 
-        # Only take velocities inside a reasonable range
-        vel_filter = (vel > 0) & (vel < 73_000)
+        # Only take velocities inside a reasonable range (the physical upper limit, or a lower --maxvel)
+        vel_filter = (vel > 0) & (vel < min(max_vel, 73_000))
 
         # Filter out all data
         vel = vel[vel_filter]
@@ -379,7 +685,7 @@ if __name__ == "__main__":
     if ht_min > 0:
         ax1.axhline(y=ht_min, color='k', linestyle='dashed', label='Ht min')
 
-    ax1.set_xlabel("Velocity (km/s)")
+    ax1.set_xlabel("Velocity relative to the ground (km/s)")
     ax1.set_ylabel("Height (km)")
 
 
@@ -398,7 +704,7 @@ if __name__ == "__main__":
     vel_filter = vel_data < max_vel
 
 
-    # Only take data in the approprite range of heights
+    # Only take data in the appropriate range of heights
     ht_filter = (ht_data/1000 >= ht_min) & (ht_data/1000 <= ht_max)
     vel_data = vel_data[ht_filter & vel_filter]
     time_data = time_data[ht_filter & vel_filter]
@@ -408,21 +714,27 @@ if __name__ == "__main__":
     ax2.scatter(vel_data/1000, time_data, s=5, label="Measurements")
     
 
-
     # Fit a line to the velocity data in the range
-    vel_fit, vel_fit_cov = scipy.optimize.curve_fit(lineFunc, time_data, vel_data)
+    popt_final, pcov_final, perr_final, vel_filter = fitVelocity(
+        time_data, vel_data, loss='soft_l1', sigma_clip=cml_args.sigma_clip
+    )
 
-    # Compute the standard deviations of the fit
-    vel_fit_std = np.sqrt(np.diag(vel_fit_cov))
+    vel_fit = popt_final
+    vel_fit_cov = pcov_final
+    vel_fit_std = perr_final
     decel_std = vel_fit_std[0]
 
-    # Remove 5 sigma outliers from the data and re-fit
-    vel_filter = np.abs(vel_data - lineFunc(time_data, *vel_fit)) < 5*decel_std
-    vel_fit, vel_fit_cov = scipy.optimize.curve_fit(lineFunc, time_data[vel_filter], vel_data[vel_filter])
+    # Compute the standard deviations of the fit
+    #vel_fit_std = np.sqrt(np.diag(vel_fit_cov))
+    #decel_std = vel_fit_std[0]
+
+    # # Remove 5 sigma outliers from the data and re-fit
+    # vel_filter = np.abs(vel_data - lineFunc(time_data, *vel_fit)) < 5*decel_std
+    # vel_fit, vel_fit_cov = scipy.optimize.curve_fit(lineFunc, time_data[vel_filter], vel_data[vel_filter])
 
     # Plot the selected outliers as an empty red circle
     ax2.scatter(vel_data[~vel_filter]/1000, time_data[~vel_filter], s=20, marker='o', facecolors='none', 
-        edgecolors='r', label="$5\\sigma$ outliers")
+        edgecolors='r', label="${:g}\\sigma$ outliers".format(cml_args.sigma_clip))
 
 
 
@@ -447,7 +759,13 @@ if __name__ == "__main__":
     decel = -vel_fit[0]
     time_eval = np.min(time_data) + eval_point*(np.max(time_data) - np.min(time_data))
     vel_eval = lineFunc(time_eval, *vel_fit)
-    ht_eval = lineFunc(time_eval, *ht_fit)
+
+    # Take the height at the evaluation time from the solver's trajectory model (which includes the gravity
+    #   drop), as computeFragEndParams() does. A line fitted to the measured heights is biased at the window
+    #   centre by the curvature of the decelerating path and by the measurement noise
+    ht_vs_time_interp, _ = interpolateHtVsTimeLen(traj)
+    ht_eval = scipy.optimize.brentq(lambda h: ht_vs_time_interp(h) - time_eval, \
+        *ht_vs_time_interp.x[[0, -1]])
 
     # Compute +/- 2 sigma deceleartion
     decel_lo = decel - 2*decel_std
@@ -461,13 +779,24 @@ if __name__ == "__main__":
     if decel_hi < 0:
         decel_hi = 0
 
+    # Take the air density at the evaluation point from the atmosphere profile, if given
+    atm_dens = None
+    if atm_table is not None:
+
+        # Check that the profile reaches the evaluation point
+        if (ht_eval < atm_table[0][0]) or (ht_eval > atm_table[0][-1]):
+            raise ValueError("The atmosphere profile ({:.1f} to {:.1f} km) does not reach the evaluation " \
+                "point at {:.2f} km".format(atm_table[0][0]/1000, atm_table[0][-1]/1000, ht_eval/1000))
+
+        atm_dens = atmDensTable(ht_eval, *atm_table)
+
     # Compute the dynamic mass (and +/- 2 sigma)
-    dyn_mass = dynamicMass(bulk_density, traj.rend_lat, traj.rend_lon, traj.rend_ele, traj.jdt_ref, \
-        vel_eval, decel, gamma=1.0, shape_factor=gamma_a)
-    dyn_mass_hi = dynamicMass(bulk_density, traj.rend_lat, traj.rend_lon, traj.rend_ele, traj.jdt_ref, \
-        vel_eval, decel_lo, gamma=1.0, shape_factor=gamma_a)
-    dyn_mass_lo = dynamicMass(bulk_density, traj.rend_lat, traj.rend_lon, traj.rend_ele, traj.jdt_ref, \
-        vel_eval, decel_hi, gamma=1.0, shape_factor=gamma_a)
+    dyn_mass = dynamicMass(bulk_density, traj.rend_lat, traj.rend_lon, ht_eval, traj.jdt_ref, \
+        vel_eval, decel, gamma=1.0, shape_factor=gamma_a, atm_dens=atm_dens)
+    dyn_mass_hi = dynamicMass(bulk_density, traj.rend_lat, traj.rend_lon, ht_eval, traj.jdt_ref, \
+        vel_eval, decel_lo, gamma=1.0, shape_factor=gamma_a, atm_dens=atm_dens)
+    dyn_mass_lo = dynamicMass(bulk_density, traj.rend_lat, traj.rend_lon, ht_eval, traj.jdt_ref, \
+        vel_eval, decel_hi, gamma=1.0, shape_factor=gamma_a, atm_dens=atm_dens)
     
 
     # Limit the dynamic mass to a 0 - maxmass range
@@ -478,6 +807,14 @@ if __name__ == "__main__":
 
 
     final_decel = final_decel_hi = final_decel_lo = 0
+
+    # Final values stay undefined (NaN) if the evaluation velocity is already below 3 km/s
+    final_mass = final_mass_hi = final_mass_lo = np.nan
+    final_lat = final_lat_hi = final_lat_lo = np.nan
+    final_lon = final_lon_hi = final_lon_lo = np.nan
+    final_ele = final_ele_hi = final_ele_lo = np.nan
+    final_azim = final_azim_hi = final_azim_lo = np.nan
+    final_elev = final_elev_hi = final_elev_lo = np.nan
 
     # Run the fragment until the final velocity of 3 km/s
     if vel_eval > 3000:
@@ -490,8 +827,9 @@ if __name__ == "__main__":
         print("  decel   = {:.2f} km/s^2".format(decel/1000))
         print("  init mass = {:.3f} kg".format(dyn_mass))
         print()
-        final_sr, final_mass, final_lat, final_lon, final_ele = computeFragEndParams(traj, dyn_mass, \
-            bulk_density, ht_eval, vel_eval, gamma_a)
+        final_sr, final_mass, final_lat, final_lon, final_ele, final_azim, final_elev = \
+            computeFragEndParams(traj, dyn_mass, bulk_density, ht_eval, vel_eval, gamma_a, \
+                atm_table=atm_table)
 
         print()
         print("Running simulation down to 3 km/s (+2 sigma mass)...")
@@ -499,8 +837,9 @@ if __name__ == "__main__":
         print("  decel = {:.2f} km/s^2".format(decel_hi/1000))
         print("  init mass = {:.3f} kg".format(dyn_mass_hi))
         print()
-        final_sr_hi, final_mass_hi, final_lat_hi, final_lon_hi, final_ele_hi = computeFragEndParams(traj, \
-            dyn_mass_hi, bulk_density, ht_eval, vel_eval, gamma_a)
+        final_sr_hi, final_mass_hi, final_lat_hi, final_lon_hi, final_ele_hi, final_azim_hi, final_elev_hi = \
+            computeFragEndParams(traj, dyn_mass_hi, bulk_density, ht_eval, vel_eval, gamma_a, \
+                atm_table=atm_table)
 
         print()
         print("Running simulation down to 3 km/s (-2 sigma mass)...")
@@ -508,8 +847,9 @@ if __name__ == "__main__":
         print("  decel = {:.2f} km/s^2".format(decel_lo/1000))
         print("  init mass = {:.3f} kg".format(dyn_mass_lo))
         print()
-        final_sr_lo, final_mass_lo, final_lat_lo, final_lon_lo, final_ele_lo = computeFragEndParams(traj, \
-            dyn_mass_lo, bulk_density, ht_eval, vel_eval, gamma_a)
+        final_sr_lo, final_mass_lo, final_lat_lo, final_lon_lo, final_ele_lo, final_azim_lo, final_elev_lo = \
+            computeFragEndParams(traj, dyn_mass_lo, bulk_density, ht_eval, vel_eval, gamma_a, \
+                atm_table=atm_table)
         
         print()
 
@@ -553,38 +893,53 @@ if __name__ == "__main__":
     print()
     print("Density = {:d} kg/m^3".format(int(bulk_density)))
     print("Gamma*A = {:.2f}".format(gamma_a))
+
+    # Print the source of the air density
+    if atm_table is not None:
+        print("Air density from the atmosphere profile: {:s}".format(cml_args.atm_profile))
+    else:
+        print("Air density from the {:s} model".format(msisModelName()))
+
     print("Decel = {:.2f} +/- {:.2f} km/s^2".format(decel/1000, decel_std/1000))
     print()
     print("Dynamic mass at {:.2f} km and {:.2f} km/s:".format(ht_eval/1000, vel_eval/1000))
+    print("(+/-2 sigma from the deceleration uncertainty only)")
     print("-2sigma = {:.3f} kg".format(dyn_mass_lo))
     print("Nominal = {:.3f} kg".format(dyn_mass))
     print("+2sigma    = {:.3f} kg".format(dyn_mass_hi))
     print()
     print("Simulation down to 3 km/s:")
     print("------------------------------------")
+    print("Azim (+E of due N) and Elev: apparent ground-fixed radiant, epoch of date, gravity turn included")
     print("Final end coordinates (-2sigma mass)")
     print("Mass      = {:.3f} kg".format(final_mass_lo))
     print("Lat (+N)  = {:.5f} deg".format(final_lat_lo))
     print("Lon (+E)  = {:.5f} deg".format(final_lon_lo))
     print("Ele MSL   = {:.2f} km".format(final_ele_lo))
+    print("Azim      = {:.5f} deg".format(final_azim_lo))
+    print("Elev      = {:.5f} deg".format(final_elev_lo))
     print("End decel = {:.3f} km/s^2".format(final_decel_lo/1000))
     print("Final end coordinates (nominal mass)")
     print("Mass      = {:.3f} kg".format(final_mass))
     print("Lat (+N)  = {:.5f} deg".format(final_lat))
     print("Lon (+E)  = {:.5f} deg".format(final_lon))
     print("Ele MSL   = {:.2f} km".format(final_ele))
+    print("Azim      = {:.5f} deg".format(final_azim))
+    print("Elev      = {:.5f} deg".format(final_elev))
     print("End decel = {:.3f} km/s^2".format(final_decel/1000))
     print("Final end coordinates (+2sigma mass)")
     print("Mass      = {:.3f} kg".format(final_mass_hi))
     print("Lat (+N)  = {:.5f} deg".format(final_lat_hi))
     print("Lon (+E)  = {:.5f} deg".format(final_lon_hi))
     print("Ele MSL   = {:.2f} km".format(final_ele_hi))
+    print("Azim      = {:.5f} deg".format(final_azim_hi))
+    print("Elev      = {:.5f} deg".format(final_elev_hi))
     print("End decel = {:.3f} km/s^2".format(final_decel_hi/1000))
 
 
     ax2.invert_yaxis()
     ax2.set_ylabel("Time (s)")
-    ax2.set_xlabel("Velocity (km/s)")
+    ax2.set_xlabel("Velocity relative to the ground (km/s)")
     
     ax1.legend()
     ax2.legend()

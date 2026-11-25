@@ -28,6 +28,7 @@ import numpy as np
 import scipy.optimize
 import scipy.interpolate
 import scipy.stats
+import scipy.linalg
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -47,12 +48,15 @@ except ImportError:
 
 import wmpl
 from wmpl.Trajectory.Orbit import calcOrbit
-from wmpl.Utils.Math import vectNorm, vectMag, meanAngle, findClosestPoints, RMSD, \
-    angleBetweenSphericalCoords, angleBetweenVectors, lineFunc, normalizeAngleWrap, confidenceInterval
+from wmpl.Utils.DragVelocity import fitDragVelocity
+from wmpl.Utils.Math import vectNorm, vectMag, meanAngle, findClosestPoints, findClosestPoints_vect, \
+    RMSD, angleBetweenSphericalCoords, angleBetweenVectors, lineFunc, normalizeAngleWrap, \
+    confidenceInterval, medianStddev, isGraphConnected
 from wmpl.Utils.Misc import valueFormat
 from wmpl.Utils.OSTools import mkdirP
+from wmpl.Utils.Physics import earthRotationVelocity
 from wmpl.Utils.Pickling import savePickle
-from wmpl.Utils.Plotting import savePlot
+from wmpl.Utils.Plotting import savePlot, stationColors
 from wmpl.Utils.PlotOrbits import plotOrbits
 from wmpl.Utils.PlotCelestial import CelestialPlot
 from wmpl.Utils.PlotMap import GroundMap
@@ -68,11 +72,11 @@ LEGEND_TEXT_SIZE = 6
 class ObservedPoints(object):
     def __init__(self, jdt_ref, meas1, meas2, time_data, lat, lon, ele, meastype, station_id=None, \
         excluded_time=None, ignore_list=None, ignore_station=False, magnitudes=None, fov_beg=None, \
-        fov_end=None, obs_id=None, comment=""):
-        """ Structure for containing data of observations from invidiual stations.
+        fov_end=None, obs_id=None, comment="", radec_jd=None):
+        """ Structure for containing data of observations from individual stations.
         
         Arguments:
-            jdt_ref: [float] reference Julian date for the measurements. Add provided times should be given
+            jdt_ref: [float] reference Julian date for the measurements. All provided times should be given
                 relative to this number. This is user selectable and can be the time of the first camera, or 
                 the first measurement, or some average time for the meteor, but should be close to the time of 
                 the meteor. This same reference date/time will be used on all camera measurements for the 
@@ -114,6 +118,11 @@ class ObservedPoints(object):
                 the same station.
             comment: [str] A comment about the observations. May be used to store RMS FF file number on which
                 the meteor was observed.
+            radec_jd: [ndarray] Only used with meastype 1. Julian date at which each R.A./Dec. was computed
+                from the camera's azimuth and elevation. None by default, which means they were all
+                computed at jdt_ref, as CAMS does. Give it for data that follows the passage of time during
+                the meteor, as RMS does: otherwise each line of sight is rotated by the Earth's rotation
+                since jdt_ref.
         """
 
         ### INPUT DATA ###
@@ -126,6 +135,11 @@ class ObservedPoints(object):
         self.jdt_ref = jdt_ref
 
         self.time_data = time_data
+
+        # Keep the absolute Julian date at which each R.A./Dec. was computed
+        self.radec_jd = None
+        if radec_jd is not None:
+            self.radec_jd = np.array(radec_jd, dtype=np.float64)
 
 
 
@@ -163,7 +177,7 @@ class ObservedPoints(object):
         self.station_id = station_id
 
         # Observed points
-        # - azim_data: azimuth +west of due north
+        # - azim_data: azimuth +east of due north
         # - elev_data: elevation angle (altitude)
         self.azim_data = None
         self.elev_data = None
@@ -285,7 +299,7 @@ class ObservedPoints(object):
         self.htmin_ele = None
         self.htmin_jd = None
 
-        # Absolute magntiudes
+        # Absolute magnitudes
         self.absolute_magnitudes = None
 
         ######################################################################################################
@@ -329,7 +343,7 @@ class ObservedPoints(object):
         # Calculate equatorial coordinates
         self.calcEquatorial()
 
-        # Calculate the Earth-centered interial coordinates of observed points
+        # Calculate the Earth-centered inertial coordinates of observed points
         self.calcECI()
 
         # Calculate position of the station in ECI coordinates (only for the reference JD, used for 
@@ -364,8 +378,9 @@ class ObservedPoints(object):
             # Make sure the excluded time is within the observations
             if (excluded_time_min >= np.min(self.time_data)) and (excluded_time_max <= np.max(time_data)):
 
+                # Start from the first and the last used point, as the indices count only the used points
                 excluded_indx_min = 0
-                excluded_indx_max = len(self.time_data) - 1
+                excluded_indx_max = np.count_nonzero(self.ignore_list == 0) - 1
 
                 # Find indices of excluded times, taking the ignored points into account
                 for i, t in enumerate(self.time_data[self.ignore_list == 0]):
@@ -436,13 +451,20 @@ class ObservedPoints(object):
 
 
     def calcAzimuthal(self):
-        """ Calculate azimuthal coordinates from right ascension and declination. """
+        """ Calculate azimuthal coordinates from right ascension and declination.
 
-        # Let the JD data be fixed to the reference time - this is done because for CAMS data the azimuthal to 
-        # equatorial conversion was done without considering the flow of time during the meteor's appearance.
-        # NOTE: If your data does account for the changing time, then jdt_ref_vect should be:
-        #   jdt_ref_vect = self.JD_data
-        jdt_ref_vect = np.zeros_like(self.ra_data) + self.jdt_ref
+        For CAMS data the azimuthal to equatorial conversion was done without considering the flow of time
+        during the meteor's appearance, so by default the JD is fixed to the reference time. Data that does
+        account for it gives the time of each conversion in radec_jd. That is the time the R.A./Dec. was
+        computed at, not JD_data: the timing offsets estimated later shift JD_data, and the azimuth and
+        elevation the camera measured must stay fixed to the Earth when they do.
+        """
+
+        # Take the time at which the R.A./Dec. were computed
+        if self.radec_jd is None:
+            jdt_ref_vect = np.zeros_like(self.ra_data) + self.jdt_ref
+        else:
+            jdt_ref_vect = self.radec_jd
 
         # Calculate azimuth and elevation
         self.azim_data, self.elev_data = raDec2AltAz_vect(self.ra_data, self.dec_data, jdt_ref_vect, self.lat, 
@@ -464,7 +486,7 @@ class ObservedPoints(object):
 
 
     def calcECI(self):
-        """ Calculate Earth-centered intertial coordinates from RA and Dec. """
+        """ Calculate Earth-centered inertial coordinates from RA and Dec. """
 
         # Calculate measurement ECI coordinates for the planes intersection method
         self.meas_eci = np.array(raDec2ECI(self.ra_data, self.dec_data)).T
@@ -477,26 +499,44 @@ class ObservedPoints(object):
 
 
     def planeFit(self):
-        """ Fits a plane through station position and observed points. """
+        """ Fits a plane through station position and observed points, by SVD of the lines of sight. """
 
-        # Add meteor line of sight positions and station positions to single arays.
-        #   Only use non-ignored points
-        x_data = np.append(self.x_eci[self.ignore_list == 0], 0)
-        y_data = np.append(self.y_eci[self.ignore_list == 0], 0)
-        z_data = np.append(self.z_eci[self.ignore_list == 0], 0)
+        # Take the lines of sight of the non-ignored points
+        meas_eci = self.meas_eci[self.ignore_list == 0]
 
-        A = np.c_[x_data, y_data, np.ones(x_data.shape[0])]
+        # Use all points if fewer than 2 are used
+        if len(meas_eci) < 2:
+            meas_eci = self.meas_eci
 
-        # Fit a linear plane through the data points, return plane params (form: aX + bY + d = Z)
-        C,_,_,_ = scipy.linalg.lstsq(A, z_data)
-
-        # Calculate the plane normal
-        N = np.array([C[0], C[1], -1.0])
+        # Take the normal most perpendicular to the lines of sight (the reduced SVD does not build the N x N
+        #   matrix of the left singular vectors, but it only gives the normal for 3 or more points)
+        _, _, vh = np.linalg.svd(meas_eci, full_matrices=(len(meas_eci) < 3))
+        N = vh[-1]
 
         # Norm the normal vector to unit length
         N = vectNorm(N)
 
         return N
+
+
+
+def observedAngularLength(obs):
+    """ Compute the angle between the first and the last used line of sight of a station.
+
+    Arguments:
+        obs: [ObservedPoints] Observations from a station.
+
+    Return:
+        [float] Angular length of the observed track (radians).
+    """
+
+    # Take the used points, or all points if fewer than 2 are used
+    meas_eci = obs.meas_eci[obs.ignore_list == 0]
+    if len(meas_eci) < 2:
+        meas_eci = obs.meas_eci
+
+    # Compute the angle from the chord, precise also for short tracks
+    return 2*np.arcsin(min(vectMag(meas_eci[-1] - meas_eci[0])/2, 1.0))
 
 
 
@@ -514,10 +554,10 @@ class PlaneIntersection(object):
         self.obs2 = obs2
 
         # Calculate the observed angular length of the track from the first station
-        obsangle1 = np.arccos(np.dot(self.obs1.meas_eci[0], self.obs1.meas_eci[-1]))
+        obsangle1 = observedAngularLength(self.obs1)
 
         # Calculate the observed angular length of the track from the second station
-        obsangle2 = np.arccos(np.dot(self.obs2.meas_eci[0], self.obs2.meas_eci[-1]))
+        obsangle2 = observedAngularLength(self.obs2)
 
 
         ### Calculate the angle between the pair of planes (convergence angle) ###
@@ -536,8 +576,13 @@ class PlaneIntersection(object):
         self.radiant_eci = np.cross(self.obs1.plane_N, self.obs2.plane_N)
         self.radiant_eci = vectNorm(self.radiant_eci)
 
+        # Take the used points of the first station, or all points if fewer than 2 are used
+        meas_eci1 = self.obs1.meas_eci[self.obs1.ignore_list == 0]
+        if len(meas_eci1) < 2:
+            meas_eci1 = self.obs1.meas_eci
+
         # If the last measurement is closer to the radiant than the first point, reverse signs
-        if np.dot(self.obs1.meas_eci[0], self.radiant_eci) < np.dot(self.obs1.meas_eci[-1], self.radiant_eci):
+        if np.dot(meas_eci1[0], self.radiant_eci) < np.dot(meas_eci1[-1], self.radiant_eci):
             self.radiant_eci = -self.radiant_eci
 
         # Calculate the radiant position in RA and Dec
@@ -727,12 +772,123 @@ def numStationsNotIgnored(observations):
 
 
 
-def angleSumMeasurements2Line(observations, state_vect, radiant_eci, weights=None, gravity=False, 
-                              gravity_factor=1.0, v0z=None):
+def dropTimeOrigin(observations):
+    """ Find the first time of the used stations, from which the gravity drop is computed.
+
+    Arguments:
+        observations: [list] A list of ObservedPoints objects.
+
+    Return:
+        [float] First time of the used stations, or of all stations if none is used (s).
+    """
+
+    # Take the first times of the used stations
+    times = [obs.time_data[0] for obs in observations if not obs.ignore_station]
+
+    # Take all stations if none is used
+    if not times:
+        times = [obs.time_data[0] for obs in observations]
+
+
+    return min(times)
+
+
+
+def solutionDropTimeOrigin(traj):
+    """ Find the time from which a solved trajectory computed the gravity drop.
+
+    Arguments:
+        traj: [Trajectory object] Solved trajectory.
+
+    Return:
+        [float] Time of the beginning of the drop (s).
+    """
+
+    t0 = getattr(traj, 'gravity_t0', None)
+
+    # Solutions from before the time was stored took the first time of all stations
+    if t0 is None:
+        t0 = min([obs.time_data[0] for obs in traj.observations])
+
+
+    return t0
+
+
+
+def gravityDropReference(observations, state_vect, radiant_eci, v_init=None):
+    """ Compute the beginning point of the trajectory, from which the gravity drop is computed.
+
+    applyGravityDrop takes r0 to be the distance of the beginning of the meteor from the centre of the Earth,
+    and its drop model descends from there with the vertical velocity, from the earliest time. Each station
+    gives the point on the radiant line closest to its first line of sight, skipping the ignored stations and
+    picks. With the initial velocity, each point is moved back along the radiant line to the earliest time,
+    and the median of the points is taken, so one station with a poor first pick does not set it. Without
+    it, the highest point is taken.
+
+    Arguments:
+        observations: [list] A list of ObservedPoints objects.
+        state_vect: [ndarray] (x, y, z) ECI coordinates of a point on the radiant line (meters).
+        radiant_eci: [ndarray] (x, y, z) components of the unit radiant direction vector.
+
+    Keyword arguments:
+        v_init: [float] Initial velocity (m/s), used to move the point back to the earliest time. None by
+            default, when it is not moved.
+
+    Return:
+        (eci0, r0): [tuple] ECI coordinates of the beginning point (meters), and its distance from the centre
+            of the Earth (meters).
+    """
+
+    # Take the first pick which is not ignored of each station which is not ignored
+    first_picks = []
+    for obs in observations:
+
+        used_picks = np.flatnonzero(np.array(obs.ignore_list) == 0)
+
+        if (not obs.ignore_station) and len(used_picks):
+            first_picks.append((obs, used_picks[0]))
+
+    # Take the first picks of all stations if all are ignored
+    if not first_picks:
+        first_picks = [(obs, 0) for obs in observations]
+
+    radiant_eci = vectNorm(radiant_eci)
+
+    # Find the earliest time, from which the drop is computed
+    t0 = dropTimeOrigin(observations)
+
+    dist_list = []
+    for obs, i in first_picks:
+
+        # Calculate closest points of approach (observed line of sight to radiant line)
+        _, rad_cpa, _ = findClosestPoints(obs.stat_eci_los[i], obs.meas_eci_los[i], state_vect, radiant_eci)
+
+        # Compute the distance of the point along the radiant line, moved back to the earliest time
+        dist = np.dot(rad_cpa - state_vect, radiant_eci)
+        if v_init is not None:
+            dist += v_init*(obs.time_data[i] - t0)
+
+        dist_list.append(dist)
+
+    # Take the median of the points, or the highest one without the initial velocity
+    if v_init is not None:
+        dist0 = np.median(dist_list)
+    else:
+        dist0 = max(dist_list)
+
+    eci0 = state_vect + dist0*radiant_eci
+
+    return eci0, vectMag(eci0)
+
+
+
+def angleSumMeasurements2Line(observations, state_vect, radiant_eci, weights=None, gravity=False, \
+                              gravity_factor=1.0, v0z=None, r0=None, gravity_vel=None, air_rotation=True, \
+                              smoothing=0.0):
     """ Sum all angles between the radiant line and measurement lines of sight.
 
         This function is used as a cost function for the least squares radiant solution of Borovicka et 
-        al. (1990). The difference from the original approach is that the distancesfrom the radiant line
+        al. (1990). The difference from the original approach is that the distances from the radiant line
         have been replaced with angles.
 
     Arguments:
@@ -745,6 +901,18 @@ def angleSumMeasurements2Line(observations, state_vect, radiant_eci, weights=Non
         gravity: [bool] If True, the gravity drop will be taken into account.
         gravity_factor: [float] Factor by which the gravity correction will be multiplied. 1.0 by default.
         v0z: [float] Initial vertical velocity of the meteor. If None, 0.0 will be used.
+        r0: [float] Distance of the beginning of the meteor from the centre of the Earth, for the gravity drop
+            (see gravityDropReference). Fixed rather than taken from the line being fitted, so the cost stays
+            continuous. If None, the distance of each point is used.
+        gravity_vel: [tuple] Speeds of the meteor against time (see Trajectory.gravity_vel), with which the
+            drop is computed across the path and slowed by the drag (see gravityDropTable). If None, the
+            meteor is dropped vertically with applyGravityDrop, using v0z and r0.
+        air_rotation: [bool] Take the drag against the air which rotates with the Earth into account in the
+            drop across the path (see gravityDropTable). True by default.
+        smoothing: [float] Smoothing of the angles near zero (rad). Each angle is replaced by
+            sqrt(angle**2 + smoothing**2) - smoothing, which is smooth at zero, as the sum of the angles has
+            a kink where an angle is zero, at which the Nelder-Mead minimization can stop (see
+            nelderMeadLine). 0.0 by default, when the angles are not smoothed.
 
     Return:
         angle_sum: [float] Sum of angles between the estimated trajectory line and individual lines of sight.
@@ -772,66 +940,78 @@ def angleSumMeasurements2Line(observations, state_vect, radiant_eci, weights=Non
     # Move the state vector to the beginning of the trajectory
     state_vect = moveStateVector(state_vect, radiant_eci, observations)
 
-    # Make sure that the radiant vector is a contigous array for faster calculations
+    # Make sure that the radiant vector is a contiguous array for faster calculations
     radiant_eci = np.ascontiguousarray(radiant_eci)
 
     # Find the earliest point in time
-    t0 = min([obs.time_data[0] for obs in observations])
+    t0 = dropTimeOrigin(observations)
 
-    angle_sum = 0.0
-    weights_sum = 1e-10
+    # Stack the points of all stations which are not ignored, with the weights of their stations
+    used_masks = [np.array(obs.ignore_list) == 0 for obs in observations]
+    stat_eci = np.concatenate([np.reshape(obs.stat_eci_los, (-1, 3))[used] \
+        for obs, used in zip(observations, used_masks)])
+    meas_eci = np.concatenate([np.reshape(obs.meas_eci_los, (-1, 3))[used] \
+        for obs, used in zip(observations, used_masks)])
+    time_rel = np.concatenate([np.array(obs.time_data, dtype=np.float64)[used] \
+        for obs, used in zip(observations, used_masks)]) - t0
+    point_weights = np.repeat(np.array(weights, dtype=np.float64), \
+        [np.count_nonzero(used) for used in used_masks])
 
-    # Go through all observations from all stations
-    for i, obs in enumerate(observations):
-        
-        # Go through all measured positions
-        for t, meas_eci, stat_eci, ignore in zip(obs.time_data, obs.meas_eci_los, obs.stat_eci_los, \
-            obs.ignore_list):
+    # Get the ECI coordinates of the projections of the measurement lines of sight on the radiant line
+    _, rad_cpa, _ = findClosestPoints_vect(stat_eci, meas_eci, state_vect, radiant_eci)
 
-            # Skip the point if it is to be ignored
-            if ignore:
-                continue
+    # Take the gravity drop across the path into account if the speeds of the meteor are given, tabulated over
+    #   the used points only so that the ignored points do not change it
+    if gravity and (gravity_vel is not None):
 
-            # Get the ECI coordinates of the projection of the measurement line of sight on the radiant line
-            _, rad_cpa, _ = findClosestPoints(stat_eci, meas_eci, state_vect, radiant_eci)
+        if len(time_rel):
 
+            drops = gravityDropVectors(gravityDropOrigin(observations, state_vect, radiant_eci, \
+                gravity_vel, t0), radiant_eci, time_rel, gravity_vel, t0, gravity_factor, \
+                air_rotation=air_rotation)
 
-            # Take the gravity drop into account
-            #   Note: here we assume that the acceleration due to gravity is fixed at the given height,
-            #   which might cause an offset of a few meters for events longer than 5 seconds
-            if gravity:
+            _, rad_cpa, _ = findClosestPoints_vect(stat_eci, meas_eci, rad_cpa + drops, radiant_eci)
 
+    # Take the vertical gravity drop into account
+    #   Note: here we assume that the acceleration due to gravity is fixed at the given height,
+    #   which might cause an offset of a few meters for events longer than 5 seconds
+    elif gravity:
 
-                # Calculate the time in seconds from the beginning of the meteor
-                t_rel = t - t0
+        # Compute the model point modified due to gravity, assuming zero vertical velocity
+        if v0z is None:
+            v0z = 0.0
 
-                # Compute the model point modified due to gravity, assuming zero vertical velocity
-                if v0z is None:
-                    v0z = 0.0
+        # Take the distance of the beginning of the meteor, or of each point itself if it is not given
+        if r0 is None:
+            r0_points = np.linalg.norm(rad_cpa, axis=1)
+        else:
+            r0_points = np.full(len(time_rel), r0, dtype=np.float64)
 
-                # Get the magnitude of the radiant vector
-                rad_cpa_mag = vectMag(rad_cpa)
+        # If the distance is 0, set it to 1 to avoid a division by zero
+        r0_points[r0_points == 0] = 1.0
 
-                # If the magnitude is 0, set it to 1 to avoid a division by zero issue
-                if rad_cpa_mag == 0:
-                    rad_cpa_mag = 1.0
-
-                rad_cpa_grav = applyGravityDrop(rad_cpa, t_rel, rad_cpa_mag, gravity_factor, v0z)
-                _, rad_cpa, _ = findClosestPoints(stat_eci, meas_eci, rad_cpa_grav, radiant_eci)
+        rad_cpa_grav = applyGravityDrop_vect(rad_cpa, time_rel, r0_points, gravity_factor, v0z)
+        _, rad_cpa, _ = findClosestPoints_vect(stat_eci, meas_eci, rad_cpa_grav, radiant_eci)
 
 
+    # Calculate the unit vectors pointing from the stations to the points on the trajectory, which are not
+    #   finite for lines of sight parallel to the line
+    station_rays = rad_cpa - stat_eci
+    with np.errstate(invalid='ignore'):
+        station_rays = station_rays/np.linalg.norm(station_rays, axis=1)[:, None]
 
-            # Calculate the unit vector pointing from the station to the point on the trajectory
-            station_ray = rad_cpa - stat_eci
-            station_ray = vectNorm(station_ray)
+    # Calculate the angles between the observed LoS and the radiant line from the chords between the
+    #   unit vectors, which is precise for small angles
+    chords = np.linalg.norm(station_rays - meas_eci, axis=1)
+    angles = 2*np.arcsin(np.minimum(chords/2, 1.0))
 
-            # Calculate the angle between the observed LoS as seen from the station and the radiant line
-            cosangle = np.dot(meas_eci, station_ray)
+    # Smooth the angles near zero, as sqrt(angle**2 + smoothing**2) - smoothing written without the
+    #   cancellation of the difference
+    if smoothing > 0:
+        angles = angles**2/(np.sqrt(angles**2 + smoothing**2) + smoothing)
 
-            # Make sure the cosine is within limits and calculate the angle
-            angle_sum += weights[i]*np.arccos(np.clip(cosangle, -1, 1))
-
-            weights_sum += weights[i]
+    angle_sum = np.sum(point_weights*angles)
+    weights_sum = 1e-10 + np.sum(point_weights)
 
 
     return angle_sum/weights_sum
@@ -839,19 +1019,21 @@ def angleSumMeasurements2Line(observations, state_vect, radiant_eci, weights=Non
 
 
 
-def minimizeAngleCost(params, observations, weights=None, gravity=False, gravity_factor=1.0, v0z=None):
+def minimizeAngleCost(params, observations, weights=None, gravity=False, gravity_factor=1.0, v0z=None, \
+    r0=None, gravity_vel=None, air_rotation=True, smoothing=0.0):
     """ A helper function for minimization of angle deviations. """
 
     state_vect, radiant_eci = np.hsplit(params, 2)
     
     return angleSumMeasurements2Line(observations, state_vect, radiant_eci, weights=weights, gravity=gravity,\
-        gravity_factor=gravity_factor, v0z=v0z)
+        gravity_factor=gravity_factor, v0z=v0z, r0=r0, gravity_vel=gravity_vel, air_rotation=air_rotation, \
+        smoothing=smoothing)
 
 
 
 
-def calcSpatialResidual(jdt_ref, jd, state_vect, radiant_eci, stat, meas, gravity=False, gravity_factor=1.0, 
-                        v0z=None):
+def calcSpatialResidual(jdt_ref, jd, state_vect, radiant_eci, stat, meas, gravity=False, gravity_factor=1.0, \
+                        v0z=None, r0=None, drop=None):
     """ Calculate horizontal and vertical residuals from the radiant line, for the given observed point.
 
     Arguments:
@@ -865,9 +1047,13 @@ def calcSpatialResidual(jdt_ref, jd, state_vect, radiant_eci, stat, meas, gravit
         gravity: [bool] Apply the correction for Earth's gravity.
         gravity_factor: [float] Factor by which the gravity correction will be multiplied. 1.0 by default.
         v0z: [float] Initial vertical velocity of the meteor. If None, 0.0 will be used.
+        r0: [float] Distance of the beginning of the meteor from the centre of the Earth, for the gravity drop
+            (see gravityDropReference). If None, the distance of the point itself is used.
+        drop: [ndarray] ECI vector of the gravity drop across the path at the point (see gravityDropTable).
+            If None, the point is dropped vertically with applyGravityDrop, using v0z and r0.
 
     Return:
-        (hres, vres): [tuple of floats] residuals in horitontal and vertical direction from the radiant line
+        (hres, vres): [tuple of floats] Residuals in horizontal and vertical direction from the radiant line.
 
     """
 
@@ -890,7 +1076,13 @@ def calcSpatialResidual(jdt_ref, jd, state_vect, radiant_eci, stat, meas, gravit
         # Correct the point on the trajectory for gravity
         if v0z is None:
             v0z = 0.0
-        rad_cpa_grav = applyGravityDrop(rad_cpa, t_rel, vectMag(rad_cpa), gravity_factor, v0z)
+        if r0 is None:
+            r0 = vectMag(rad_cpa)
+
+        if drop is not None:
+            rad_cpa_grav = rad_cpa + drop
+        else:
+            rad_cpa_grav = applyGravityDrop(rad_cpa, t_rel, r0, gravity_factor, v0z)
 
         # ###########################
 
@@ -915,9 +1107,8 @@ def calcSpatialResidual(jdt_ref, jd, state_vect, radiant_eci, stat, meas, gravit
     rad_RA,rad_Dec = eci2RaDec(radiant_eci)
     rad_azim,rad_elev = raDec2AltAz(rad_RA, rad_Dec, jd, lat, lon)
 
-    # Form an orthgoonal right handed reference frame in ENU coordinates with the x axis pointing to the radiant.
-    # y axis pointing along horizon at 90 degrees counter-clockwise to radiant.
-    # z-axis such that vz = hx^hy
+    # Form an orthogonal right handed reference frame in ENU coordinates, with the x axis pointing to the
+    #   radiant, the y axis along the horizon 90 deg counter-clockwise from it and the z axis as x cross y
 
     # Azimx points towards the radiant
     azimx = rad_azim
@@ -950,14 +1141,14 @@ def calcSpatialResidual(jdt_ref, jd, state_vect, radiant_eci, stat, meas, gravit
     ehy = np.dot(p, hy_eci)
 
     # Explanation of the residuals:
-    # The vertical residuals have a positive sign for any "measured" CPA point lying above the plane of the 
-    # fitted (model) trajectory. The reference frame x-axis points towards the radiant, and as you look 
-    # towards the radiant the y-axis points to your left. The horizontal residual is effectively the dot 
-    # product with the y-axis which therefore has a positive sign for measured CPA's to the left of the model 
-    # trajectory. Since the CPA vector is calculated to be perpendicular to the x-axis, the dot product of 
-    # this is vanishingly small. We retain the form of square root of the x & y axes dot products for 
-    # completeness, and this would also become important if a velocity model was used. It is also important 
-    # that z = x^y for right-handed axes.
+    # The vertical residuals have a positive sign for any "measured" CPA point lying above the plane of the
+    # fitted (model) trajectory. The reference frame x-axis points towards the radiant, and as you look
+    # down the trajectory (radiant behind you) the y-axis points to your right. The horizontal residual is
+    # effectively the dot product with the y-axis which therefore has a positive sign for measured CPA's to
+    # the right of the model trajectory. Since the CPA vector is calculated to be perpendicular to the x-axis,
+    # the dot product of this is vanishingly small. We retain the form of square root of the x & y axes dot
+    # products for completeness, and this would also become important if a velocity model was used. It is
+    # also important that z = x^y for right-handed axes.
                                                     
     # Calculate horizontal residuals
     # Looking along the trajectory (radiant behind you, you're on top of the trajectory), 
@@ -978,7 +1169,7 @@ def lineFuncLS(params, x, y, weights):
     
     Arguments:
         params: [list] Line parameters 
-        x: [float] Independant variable
+        x: [float] Independent variable
         y: [float] Estimated values
 
     Keyword arguments:
@@ -1019,7 +1210,7 @@ def jacchiaLengthFunc(t, a1, a2, v_init, k):
     
     Arguments:
         t: [float] Time in seconds at which the Jacchia function will be evaluated.
-        a1: [float] 1st decelerationn term.
+        a1: [float] 1st deceleration term.
         a2: [float] 2nd deceleration term.
         v_init: [float] Initial velocity in m/s.
         k: [float] Initial offset in length.
@@ -1039,10 +1230,9 @@ def jacchiaVelocityFunc(t, a1, a2, v_init):
     
     Arguments:
         t: [float] Time in seconds at which the Jacchia function will be evaluated.
-        a1: [float] 1st decelerationn term.
+        a1: [float] 1st deceleration term.
         a2: [float] 2nd deceleration term.
         v_init: [float] Initial velocity in m/s.
-        k: [float] Initial offset in length.
 
     Return:
         [float] velocity at time t
@@ -1074,6 +1264,118 @@ def checkWeights(observations, weights):
 
 
     return weights
+
+
+
+def pairTimingPoints(obs1, obs2, time1, time2):
+    """ Take the points of two stations whose times are compared in the timing residuals. The points of the
+        second station are compared to the times of the first station interpolated at their lengths.
+
+    Arguments:
+        obs1: [ObservedPoints object] First station.
+        obs2: [ObservedPoints object] Second station.
+        time1: [ndarray] Times of all points of the first station, with its time offset (s).
+        time2: [ndarray] Times of all points of the second station, with its time offset (s).
+
+    Return:
+        (time1, len1, time2, len2): [tuple] Times (s) and lengths (m) of the used points of the first station,
+            and of the points of the second station which are compared to them, or None if fewer than 4 points
+            of the second station are within the lengths of the first station.
+    """
+
+    # Exclude ignored points
+    len1 = obs1.state_vect_dist[obs1.ignore_list == 0]
+    time1 = time1[obs1.ignore_list == 0]
+    len2 = obs2.state_vect_dist[obs2.ignore_list == 0]
+    time2 = time2[obs2.ignore_list == 0]
+
+    # Find common points in length between both stations
+    common_pts = np.where((len2 >= np.min(len1)) & (len2 <= np.max(len1)))
+
+
+    # Do not compare the stations if there is no, or almost no overlap
+    if len(common_pts[0]) < 4:
+        return None
+
+
+    # Take only the common points
+    time2 = time2[common_pts]
+    len2 = len2[common_pts]
+
+
+    # If there are any excluded points in the reference observations, do not take their
+    # pairs from the other site into consideration
+    if obs1.excluded_indx_range:
+
+        # Extract excluded indices
+        excluded_indx_min, excluded_indx_max = obs1.excluded_indx_range
+
+        # Get the range of lengths inside the exclusion zone
+        len1_excluded_min = len1[excluded_indx_min]
+        len1_excluded_max = len1[excluded_indx_max]
+
+        # Select only those lengths in the other station which are outside the exclusion zone
+        temp_arr = np.c_[time2, len2]
+        temp_arr = temp_arr[~((temp_arr[:, 1] >= len1_excluded_min) \
+            & (temp_arr[:, 1] <= len1_excluded_max))]
+
+        time2, len2 = temp_arr.T
+
+
+    return time1, len1, time2, len2
+
+
+
+def comparedStationPairs(observations, weights=None):
+    """ Find the pairs of used stations whose times are compared in the timing residuals, with at least one
+        point and a weight.
+
+    Arguments:
+        observations: [list] A list of ObservedPoints objects.
+
+    Keyword arguments:
+        weights: [list] A list of statistical weights for every station. None by default, in which case the
+            used stations have equal weights.
+
+    Return:
+        [list] Pairs of indices of the stations whose times are compared.
+    """
+
+    weights = checkWeights(observations, weights)
+
+    compared_pairs = []
+    for i, obs1 in enumerate(observations):
+        for j, obs2 in enumerate(observations):
+
+            if (j <= i) or obs1.ignore_station or obs2.ignore_station:
+                continue
+
+            pair_points = pairTimingPoints(obs1, obs2, obs1.time_data, obs2.time_data)
+
+            # Take the pair only if a point is compared and the pair has a weight in the residuals
+            if (pair_points is not None) and len(pair_points[2]) and (weights[i]*weights[j] > 0):
+                compared_pairs.append((i, j))
+
+
+    return compared_pairs
+
+
+
+def numOffsetsAtLimit(observations, time_dict, time_offsets, max_toffset):
+    """ Count the used stations whose estimated time offset is at the maximum time offset.
+
+    Arguments:
+        observations: [list] A list of ObservedPoints objects.
+        time_dict: [dict] Time offset status of every station, True if the offset is estimated.
+        time_offsets: [ndarray] Time offset of every station (s).
+        max_toffset: [float] Maximum time offset (s).
+
+    Return:
+        [int] Number of used stations whose estimated time offset is at the maximum time offset.
+    """
+
+    return len([obs for obs, t_diff in zip(observations, time_offsets) if (not obs.ignore_station) \
+        and isinstance(time_dict[str(obs.station_id)], bool) and np.isclose(np.abs(t_diff), max_toffset)])
 
 
 
@@ -1151,52 +1453,19 @@ def timingResiduals(params, observations, time_dict, weights=None, ret_stddev=Fa
             if j <= i:
                 continue
 
-            # Extract times and lengths from both stations
-            time1, len1 = state_vect_distances[i]
-            time2, len2 = state_vect_distances[j]
-
-            # Exclude ignored points
-            time1 = time1[observations[i].ignore_list == 0]
-            len1 = len1[observations[i].ignore_list == 0]
-            time2 = time2[observations[j].ignore_list == 0]
-            len2 = len2[observations[j].ignore_list == 0]
-
-            # Find common points in length between both stations
-            common_pts = np.where((len2 >= np.min(len1)) & (len2 <= np.max(len1)))
-
-
-            # Continue without fitting the timing is there is no, or almost no overlap
-            if len(common_pts[0]) < 4:
+            # Take the points of both stations which are compared, skipping the pair if there is no, or almost
+            #   no overlap
+            pair_points = pairTimingPoints(observations[i], observations[j], state_vect_distances[i][0], \
+                state_vect_distances[j][0])
+            if pair_points is None:
                 continue
 
 
             # Keep track of stations with confirmed overlaps
             confirmed_overlaps.append(observations[i].station_id)
             confirmed_overlaps.append(observations[j].station_id)
-            
 
-            # Take only the common points
-            time2 = time2[common_pts]
-            len2 = len2[common_pts]
-
-
-            # If there are any excluded points in the reference observations, do not take their
-            # pairs from the other site into consideration
-            if observations[i].excluded_indx_range:
-
-                # Extract excluded indices
-                excluded_indx_min, excluded_indx_max = observations[i].excluded_indx_range
-
-                # Get the range of lengths inside the exclusion zone
-                len1_excluded_min = len1[excluded_indx_min]
-                len1_excluded_max = len1[excluded_indx_max]
-
-                # Select only those lengths in the other station which are outside the exclusion zone
-                temp_arr = np.c_[time2, len2]
-                temp_arr = temp_arr[~((temp_arr[:, 1] >= len1_excluded_min) \
-                    & (temp_arr[:, 1] <= len1_excluded_max))]
-
-                time2, len2 = temp_arr.T
+            time1, len1, time2, len2 = pair_points
 
 
             # Interpolate the first (i.e. reference length)
@@ -1243,6 +1512,33 @@ def timingResiduals(params, observations, time_dict, weights=None, ret_stddev=Fa
 
 
 
+# How many times to continue a line of sight minimization which ran out of function evaluations
+LOS_CONTINUE_RUNS = 3
+
+
+
+def stateVectorDiverged(new, old, limit=0.1):
+    """ Check if the minimization took the state vector far from where it started. The move is measured
+        relative to the magnitude of the state vector, because relative to each coordinate it is large for
+        any small move when the coordinate is near 0.
+
+    Arguments:
+        new: [ndarray] (x, y, z) ECI coordinates of the minimized state vector (meters).
+        old: [ndarray] (x, y, z) ECI coordinates of the initial state vector (meters).
+
+    Keyword arguments:
+        limit: [float] Largest move which is not a divergence, as a fraction of the magnitude of the initial
+            state vector. 0.1 by default.
+
+    Return:
+        [bool] True if the state vector diverged.
+
+    """
+
+    return vectMag(new - old)/vectMag(old) > limit
+
+
+
 def moveStateVector(state_vect, radiant_eci, observations):
     """ Moves the state vector position along the radiant line until it is before any points which are
         projected on it. This is used to make sure that lengths and lags are properly calculated.
@@ -1265,9 +1561,13 @@ def moveStateVector(state_vect, radiant_eci, observations):
     nonignored_observations = [obstmp for obstmp in observations if not obstmp.ignore_station]
     for obs in nonignored_observations:
 
+        # Take the first point which is not ignored
+        used_picks = np.flatnonzero(np.array(obs.ignore_list) == 0)
+        first = used_picks[0] if len(used_picks) else 0
+
         # Calculate closest points of approach (observed line of sight to radiant line) of the first point
         # on the trajectory across all stations
-        _, rad_cpa, _ = findClosestPoints(obs.stat_eci_los[0], obs.meas_eci_los[0], state_vect, 
+        _, rad_cpa, _ = findClosestPoints(obs.stat_eci_los[first], obs.meas_eci_los[first], state_vect, \
             radiant_eci)
 
         rad_cpa_list.append(rad_cpa)
@@ -1287,6 +1587,279 @@ def moveStateVector(state_vect, radiant_eci, observations):
 
 
     return np.ascontiguousarray(rad_cpa_beg)
+
+
+
+# Size of the first simplex of the line-of-sight fit, as a move of the line at the ends of the meteor (m)
+LOS_SIMPLEX_SIZE = 100.0
+
+# Size of the simplex at which a Nelder-Mead minimization of the line-of-sight fit stops (m)
+LOS_SIMPLEX_TOLERANCE = 1e-3
+
+# Largest move of the line by a fresh simplex at which the line-of-sight fit has converged (m)
+LOS_RESTART_TOLERANCE = 1e-2
+
+# Largest number of fresh simplices in the line-of-sight fit
+LOS_MAX_SIMPLICES = 10
+
+# Steps of the fresh simplices, along the coordinates and turned by a Hadamard matrix, used in turn
+LOS_SIMPLEX_DIRECTIONS = [np.eye(4), 0.5*np.array([[1.0, 1.0, 1.0, 1.0], [1.0, -1.0, 1.0, -1.0], \
+    [1.0, 1.0, -1.0, -1.0], [1.0, -1.0, -1.0, 1.0]])]
+
+# Smoothings of the angles of the line-of-sight fit near zero, in the minimizations before the exact one
+#   (arcsec)
+LOS_SMOOTHING = [10.0, 1.0, 0.1, 0.01]
+
+
+
+def lineFrame(state_vect, radiant_eci, observations):
+    """ Make a frame of the four degrees of freedom of a line: two rotations about the middle of the meteor
+        and two shifts across the line, all as moves of the line at the ends of the meteor (m).
+
+    Arguments:
+        state_vect: [ndarray] (x, y, z) ECI coordinates of a point on the line (meters).
+        radiant_eci: [ndarray] (x, y, z) components of the radiant direction vector.
+        observations: [list] A list of ObservationPoints objects which hold measurements from individual
+            stations.
+
+    Return:
+        (middle, half_length, radiant, axes):
+            - middle: [ndarray] ECI coordinates of the middle of the observed part of the meteor (meters).
+            - half_length: [float] Half of the length of the observed part of the meteor (meters).
+            - radiant: [ndarray] Unit radiant vector of the line.
+            - axes: [ndarray] Two unit vectors perpendicular to the radiant, as rows.
+    """
+
+    radiant = vectNorm(radiant_eci)
+
+    # Project the first and the last used point of every used station on the line
+    distances = []
+    for obs in observations:
+
+        if obs.ignore_station:
+            continue
+
+        used = np.where(np.array(obs.ignore_list) == 0)[0]
+        if len(used) == 0:
+            continue
+
+        for i in (used[0], used[-1]):
+            _, rad_cpa, _ = findClosestPoints(obs.stat_eci_los[i], obs.meas_eci_los[i], state_vect, radiant)
+            distance = np.dot(rad_cpa - state_vect, radiant)
+
+            # Skip a line of sight parallel to the line
+            if np.isfinite(distance):
+                distances.append(distance)
+
+    # Take the middle of the observed part, and keep the half length above 1 m
+    middle = np.array(state_vect, dtype=np.float64)
+    half_length = 1.0
+    if distances:
+        middle = state_vect + radiant*(min(distances) + max(distances))/2
+        half_length = max((max(distances) - min(distances))/2, 1.0)
+
+    # Choose two axes perpendicular to the radiant
+    reference = np.array([1.0, 0.0, 0.0])
+    if np.abs(radiant[0]) > 0.9:
+        reference = np.array([0.0, 1.0, 0.0])
+
+    axis_1 = vectNorm(np.cross(radiant, reference))
+    axis_2 = np.cross(radiant, axis_1)
+
+
+    return middle, half_length, radiant, np.array([axis_1, axis_2])
+
+
+
+def lineFromFrame(coords, frame):
+    """ Compute the line at the given coordinates of a frame made by lineFrame.
+
+    Arguments:
+        coords: [ndarray] Rotation (2) and shift (2) of the line, as moves at the ends of the meteor (meters).
+        frame: [tuple] Frame of the coordinates, as returned by lineFrame.
+
+    Return:
+        [ndarray] ECI coordinates of a point on the line (meters) and the unit radiant vector, joined.
+    """
+
+    middle, half_length, radiant, axes = frame
+
+    return np.r_[middle + np.dot(coords[2:], axes), vectNorm(radiant + np.dot(coords[:2], axes)/half_length)]
+
+
+
+def nelderMeadLineRestarts(fun, x0, args, maxfev=None, fun_kwargs=None):
+    """ Minimize a cost of a line with Nelder-Mead over the four coordinates of a line frame (see lineFrame),
+        restarted with a fresh simplex until two in a row move the line by less than LOS_RESTART_TOLERANCE
+        (see nelderMeadLine).
+
+    Arguments:
+        fun: [function] Cost of the line, called as fun(params, *args, **fun_kwargs), where params are the ECI
+            coordinates of a point on the line (meters) and the radiant vector, joined.
+        x0: [ndarray] Initial parameters of the line.
+        args: [tuple] Arguments of the cost, starting with the list of ObservationPoints objects.
+
+    Keyword arguments:
+        maxfev: [int] Largest number of evaluations of the cost in all minimizations. None by default, when
+            each minimization has the limit of the Nelder-Mead method of scipy.
+        fun_kwargs: [dict] Keyword arguments of the cost. None by default.
+
+    Return:
+        [OptimizeResult] Result of the last Nelder-Mead minimization, with the parameters of the line and the
+            iterations and evaluations of all minimizations. If the line still moved after LOS_MAX_SIMPLICES
+            fresh simplices, the message says so.
+    """
+
+    if fun_kwargs is None:
+        fun_kwargs = {}
+
+    observations = args[0]
+    params = np.array(x0, dtype=np.float64)
+    simplex_size = LOS_SIMPLEX_SIZE
+    still_runs = 0
+    nit = 0
+    nfev = 0
+
+    for i in range(LOS_MAX_SIMPLICES):
+
+        # Start from a fresh simplex around the current line
+        frame = lineFrame(params[:3], params[3:], observations)
+        directions = LOS_SIMPLEX_DIRECTIONS[i%len(LOS_SIMPLEX_DIRECTIONS)]
+        simplex = np.vstack([np.zeros(4), simplex_size*directions])
+
+        # Stop each minimization on the size of the simplex only
+        options = {'initial_simplex': simplex, 'xatol': LOS_SIMPLEX_TOLERANCE, 'fatol': np.inf}
+
+        # Give each minimization the evaluations which are left
+        if maxfev is not None:
+            options['maxfev'] = maxfev - nfev
+
+        solution = scipy.optimize.minimize(lambda coords: fun(lineFromFrame(coords, frame), *args, \
+            **fun_kwargs), np.zeros(4), method='Nelder-Mead', options=options)
+
+        nit += solution.nit
+        nfev += solution.nfev
+        params = lineFromFrame(solution.x, frame)
+
+        # Stop when no evaluations are left, or a minimization ran out of them
+        if ((maxfev is not None) and (nfev >= maxfev)) or (not solution.success):
+            break
+
+        # Stop when two fresh simplices in a row converged without moving the line
+        move = np.max(np.abs(solution.x))
+        if solution.success and (move < LOS_RESTART_TOLERANCE):
+            still_runs += 1
+        else:
+            still_runs = 0
+
+        if still_runs >= 2:
+            break
+
+        # Scale the next simplex to the last move
+        simplex_size = min(max(10*move, 1.0), LOS_SIMPLEX_SIZE)
+
+    # Say when the line still moved after the last fresh simplex, which is kept as it lowered the cost
+    if solution.success and (still_runs < 2):
+        solution.message = "The line still moved after {:d} fresh simplices".format(LOS_MAX_SIMPLICES)
+
+    solution.x = params
+    solution.nit = nit
+    solution.nfev = nfev
+
+
+    return solution
+
+
+
+def nelderMeadLine(fun, x0, args=(), maxfev=None, smoothing=None, **kwargs):
+    """ Minimize a cost of a line with Nelder-Mead over the four coordinates of a line frame (see lineFrame).
+        It is given to scipy.optimize.minimize as the method. With the six parameters of a state vector and a
+        radiant, the simplex can collapse and stop short of the minimum (McKinnon 1998). The minimization is
+        therefore restarted with a fresh simplex (Kelley 1999) until two in a row move the line by less than
+        LOS_RESTART_TOLERANCE (see nelderMeadLineRestarts).
+
+        The sum of the angles between the lines of sight and the line has a kink where an angle is zero, at
+        which the simplex can also stop short of the minimum. The cost is therefore first minimized with the
+        angles smoothed near zero by decreasing amounts (see angleSumMeasurements2Line), each time from the
+        minimum of the one before, and then exactly.
+
+        References:
+            McKinnon, K. I. M. (1998). Convergence of the Nelder-Mead simplex method to a nonstationary
+                point. SIAM Journal on Optimization, 9(1), 148-158.
+            Kelley, C. T. (1999). Detection and remediation of stagnation in the Nelder-Mead algorithm using
+                a sufficient decrease condition. SIAM Journal on Optimization, 10(1), 43-55.
+
+    Arguments:
+        fun: [function] Cost of the line, called as fun(params, *args), where params are the ECI coordinates
+            of a point on the line (meters) and the radiant vector, joined. With the smoothing, it is also
+            called as fun(params, *args, smoothing=smoothing), with the smoothing of the angles (rad).
+        x0: [ndarray] Initial parameters of the line.
+
+    Keyword arguments:
+        args: [tuple] Arguments of the cost, starting with the list of ObservationPoints objects. It must
+            be given.
+        maxfev: [int] Largest number of evaluations of the cost in all minimizations. None by default, when
+            each minimization has the limit of the Nelder-Mead method of scipy.
+        smoothing: [list] Smoothings of the angles in the minimizations before the exact one (arcsec). None
+            by default, when LOS_SMOOTHING is used. An empty list minimizes the exact cost only.
+        kwargs: [dict] Other arguments given by scipy.optimize.minimize, not used.
+
+    Return:
+        [OptimizeResult] Result of the last Nelder-Mead minimization of the exact cost, with the point on the
+            line moved to the beginning of the meteor, a unit radiant vector, and the iterations and
+            evaluations of all minimizations. Its cost is never higher than at the start, which is returned
+            if no minimization lowered it. If the line still moved after LOS_MAX_SIMPLICES fresh simplices,
+            the success of the last minimization is kept and the message says so.
+    """
+
+    if smoothing is None:
+        smoothing = LOS_SMOOTHING
+
+    observations = args[0]
+
+    # Compute the cost at the start, which the result must not exceed
+    start_params = np.array(x0, dtype=np.float64)
+    start_cost = fun(start_params, *args)
+    nfev = 1
+    nit = 0
+
+    # Minimize the smoothed costs in turn, each with at most half of the evaluations which are left
+    params = start_params
+    for smoothing_arcsec in smoothing:
+
+        maxfev_stage = None
+        if maxfev is not None:
+            maxfev_stage = (maxfev - nfev)//2
+
+            if maxfev_stage < 1:
+                break
+
+        solution = nelderMeadLineRestarts(fun, params, args, maxfev=maxfev_stage, \
+            fun_kwargs={'smoothing': np.radians(smoothing_arcsec/3600)})
+
+        nit += solution.nit
+        nfev += solution.nfev
+        params = solution.x
+
+    # Minimize the exact cost from the minimum of the last smoothed cost
+    solution = nelderMeadLineRestarts(fun, params, args, maxfev=(None if maxfev is None else maxfev - nfev))
+    nit += solution.nit
+    nfev += solution.nfev
+    params = solution.x
+
+    # Keep the start if the minimizations did not lower its cost
+    if np.isfinite(start_cost) and (not (solution.fun <= start_cost)):
+        params = np.r_[start_params[:3], vectNorm(start_params[3:])]
+        solution.fun = start_cost
+
+    # Return the line with the state vector at the beginning of the meteor
+    params[:3] = moveStateVector(params[:3], params[3:], observations)
+    solution.x = params
+    solution.nit = nit
+    solution.nfev = nfev
+
+
+    return solution
 
 
 
@@ -1515,7 +2088,7 @@ class MCUncertainties(object):
         self.Tj = None
         self.Tj_ci = None
 
-# Preserve compatibility with pickle files genrated before the typo fix
+# Preserve compatibility with pickle files generated before the typo fix
 MCUncertanties = MCUncertainties
 
 
@@ -1561,38 +2134,38 @@ def calcMCUncertainties(traj_list, traj_best):
     un.radiant_eci_mini = np.array([rad_x, rad_y, rad_z])
     un.radiant_eci_mini_ci = np.array([rad_x_ci, rad_y_ci, rad_z_ci])
 
-    # Velocity state vector
-    un.vx = abs(traj_best.v_init*traj_best.radiant_eci_mini[0]*(un.v_init/traj_best.v_init
-        + rad_x/traj_best.radiant_eci_mini[0]))
+    # Velocity state vector from the spread of the runs
+    un.vx = np.std([traj.v_init*traj.radiant_eci_mini[0] for traj in traj_list])
     un.vx_ci = confidenceInterval([traj.v_init*traj.radiant_eci_mini[0] for traj in traj_list], un.ci)
-    un.vy = abs(traj_best.v_init*traj_best.radiant_eci_mini[1]*(un.v_init/traj_best.v_init
-        + rad_y/traj_best.radiant_eci_mini[1]))
+    un.vy = np.std([traj.v_init*traj.radiant_eci_mini[1] for traj in traj_list])
     un.vy_ci = confidenceInterval([traj.v_init*traj.radiant_eci_mini[1] for traj in traj_list], un.ci)
-    un.vz = abs(traj_best.v_init*traj_best.radiant_eci_mini[2]*(un.v_init/traj_best.v_init
-        + rad_z/traj_best.radiant_eci_mini[2]))
+    un.vz = np.std([traj.v_init*traj.radiant_eci_mini[2] for traj in traj_list])
     un.vz_ci = confidenceInterval([traj.v_init*traj.radiant_eci_mini[2] for traj in traj_list], un.ci)
 
 
-    # Beginning/ending points
+    # Beginning/ending points. The errors in meters use the meridian (M) and the prime vertical (N) radii of
+    #   curvature at the height of the point
     N_beg = EARTH.EQUATORIAL_RADIUS/np.sqrt(1.0 - (EARTH.E**2)*np.sin(traj_best.rbeg_lat)**2)
+    M_beg = N_beg*(1.0 - EARTH.E**2)/(1.0 - (EARTH.E**2)*np.sin(traj_best.rbeg_lat)**2)
     un.rbeg_lon = scipy.stats.circstd([traj.rbeg_lon for traj in traj_list])
     un.rbeg_lon_ci = confidenceInterval([traj.rbeg_lon for traj in traj_list], un.ci, angle=True)
-    un.rbeg_lon_m = np.sin(un.rbeg_lon)*np.cos(traj_best.rbeg_lat)*N_beg
+    un.rbeg_lon_m = np.sin(un.rbeg_lon)*np.cos(traj_best.rbeg_lat)*(N_beg + traj_best.rbeg_ele_wgs84)
     un.rbeg_lat = np.std([traj.rbeg_lat for traj in traj_list])
     un.rbeg_lat_ci = confidenceInterval([traj.rbeg_lat for traj in traj_list], un.ci)
-    un.rbeg_lat_m = np.sin(un.rbeg_lat)*N_beg
+    un.rbeg_lat_m = np.sin(un.rbeg_lat)*(M_beg + traj_best.rbeg_ele_wgs84)
     un.rbeg_ele = np.std([traj.rbeg_ele for traj in traj_list])
     un.rbeg_ele_ci = confidenceInterval([traj.rbeg_ele for traj in traj_list], un.ci)
     un.rbeg_ele_wgs84 = np.std([traj.rbeg_ele_wgs84 for traj in traj_list])
     un.rbeg_ele_wgs84_ci = confidenceInterval([traj.rbeg_ele_wgs84 for traj in traj_list], un.ci)
 
     N_end = EARTH.EQUATORIAL_RADIUS/np.sqrt(1.0 - (EARTH.E**2)*np.sin(traj_best.rend_lat)**2)
+    M_end = N_end*(1.0 - EARTH.E**2)/(1.0 - (EARTH.E**2)*np.sin(traj_best.rend_lat)**2)
     un.rend_lon = scipy.stats.circstd([traj.rend_lon for traj in traj_list])
     un.rend_lon_ci = confidenceInterval([traj.rend_lon for traj in traj_list], un.ci, angle=True)
-    un.rend_lon_m = np.sin(un.rend_lon)*np.cos(traj_best.rend_lat)*N_end
+    un.rend_lon_m = np.sin(un.rend_lon)*np.cos(traj_best.rend_lat)*(N_end + traj_best.rend_ele_wgs84)
     un.rend_lat = np.std([traj.rend_lat for traj in traj_list])
     un.rend_lat_ci = confidenceInterval([traj.rend_lat for traj in traj_list], un.ci)
-    un.rend_lat_m = np.sin(un.rend_lat)*N_end
+    un.rend_lat_m = np.sin(un.rend_lat)*(M_end + traj_best.rend_ele_wgs84)
     un.rend_ele = np.std([traj.rend_ele for traj in traj_list])
     un.rend_ele_ci = confidenceInterval([traj.rend_ele for traj in traj_list], un.ci)
     un.rend_ele_wgs84 = np.std([traj.rend_ele_wgs84 for traj in traj_list])
@@ -1600,12 +2173,13 @@ def calcMCUncertainties(traj_list, traj_best):
 
     # Lowest point
     N_end = EARTH.EQUATORIAL_RADIUS/np.sqrt(1.0 - (EARTH.E**2)*np.sin(traj_best.htmin_lat)**2)
+    M_end = N_end*(1.0 - EARTH.E**2)/(1.0 - (EARTH.E**2)*np.sin(traj_best.htmin_lat)**2)
     un.htmin_lon = scipy.stats.circstd([traj.htmin_lon for traj in traj_list])
     un.htmin_lon_ci = confidenceInterval([traj.htmin_lon for traj in traj_list], un.ci, angle=True)
-    un.htmin_lon_m = np.sin(un.htmin_lon)*np.cos(traj_best.htmin_lat)*N_end
+    un.htmin_lon_m = np.sin(un.htmin_lon)*np.cos(traj_best.htmin_lat)*(N_end + traj_best.htmin_ele_wgs84)
     un.htmin_lat = np.std([traj.htmin_lat for traj in traj_list])
     un.htmin_lat_ci = confidenceInterval([traj.htmin_lat for traj in traj_list], un.ci)
-    un.htmin_lat_m = np.sin(un.htmin_lat)*N_end
+    un.htmin_lat_m = np.sin(un.htmin_lat)*(M_end + traj_best.htmin_ele_wgs84)
     un.htmin_ele = np.std([traj.htmin_ele for traj in traj_list])
     un.htmin_ele_ci = confidenceInterval([traj.htmin_ele for traj in traj_list], un.ci)
     un.htmin_ele_wgs84 = np.std([traj.htmin_ele_wgs84 for traj in traj_list])
@@ -1741,7 +2315,7 @@ def calcMCUncertainties(traj_list, traj_best):
             un.mean_anomaly_ci = confidenceInterval([traj.orbit.mean_anomaly for traj in traj_list], un.ci, \
                 angle=True)
 
-            # Last perihelion uncertanty (days)
+            # Last perihelion uncertainty (days)
             last_perihelion_list = [datetime2JD(traj.orbit.last_perihelion) for traj \
                 in traj_list if isinstance(traj.orbit.last_perihelion, datetime.datetime)]
             if len(last_perihelion_list):
@@ -1773,8 +2347,8 @@ def calcCovMatrices(mc_traj_list):
     """ Calculate the covariance matrix between orbital elements, and initial state vector using all Monte 
         Carlo trajectories. The covariance matrix is weighted by the timing residuals.
 
-        The orbital covariance matrix is calculated for radians and the inital state vector matrix in meters
-        and meters per second.
+        The orbital covariance matrix is calculated with the angles in degrees and the initial state vector
+        matrix in meters and meters per second.
 
     Arguments:
         mc_traj_list: [list] A list of Trajectory objects from Monte Carlo runs.
@@ -1799,7 +2373,6 @@ def calcCovMatrices(mc_traj_list):
 
     # Calculate the weights using timing residuals
     weights = np.min(timing_res_list)/timing_res_list
-    weights = weights
 
     # Extract orbit elements
     e_list = np.array([traj.orbit.e for traj in mc_traj_list])
@@ -1815,11 +2388,11 @@ def calcCovMatrices(mc_traj_list):
     orbit_cov = np.cov(orbit_input, aweights=weights)
 
 
-    # Extract inital state vectors
+    # Extract initial state vectors
     state_vect_list = np.array([traj.state_vect_mini for traj in mc_traj_list])
     initial_vel_vect_list = np.array([traj.v_init*traj.radiant_eci_mini for traj in mc_traj_list])
 
-    # Calculate inital state vector covariance
+    # Calculate initial state vector covariance
     state_vect_input = np.hstack([state_vect_list, initial_vel_vect_list]).T
     state_vect_cov = np.cov(state_vect_input, aweights=weights)
 
@@ -1829,9 +2402,43 @@ def calcCovMatrices(mc_traj_list):
 
 
 
+def sampleMCVelocities(traj_list):
+    """ Sample the initial velocity of every trajectory within the standard deviation of its direct fit,
+        and recompute the orbit. Used for the Monte Carlo uncertainties when the timing is not estimated, as
+        the noise is only added to the angles and it does not change the velocity.
+
+    Arguments:
+        traj_list: [list] A list of Trajectory objects.
+
+    Return:
+        [list] A list of copies of the Trajectory objects, with sampled velocities and orbits.
+    """
+
+    traj_list_sampled = []
+
+    for traj in traj_list:
+
+        traj_sampled = copy.copy(traj)
+
+        # Sample the initial velocity
+        if traj.v_init_stddev:
+            traj_sampled.v_init = traj.v_init + np.random.normal(0, traj.v_init_stddev)
+
+        # Recompute the orbit with the sampled velocity
+        traj_sampled.orbit = calcOrbit(traj.radiant_eci_mini, traj_sampled.v_init, traj.v_avg, \
+            traj.state_vect_mini, traj.rbeg_jd, stations_fixed=(not traj.orbit_los_success), \
+            reference_init=traj.orbit_los_success, v_init_stddev_direct=traj.v_init_stddev)
+
+        traj_list_sampled.append(traj_sampled)
+
+
+    return traj_list_sampled
+
+
+
 def trajNoiseGenerator(traj, noise_sigma):
-    """ Given a base trajectory object and the observation uncertainly, this generator will generate
-        new trajectory objects with noise-added obsevations. 
+    """ Given a base trajectory object and the observation uncertainty, this generator will generate
+        new trajectory objects with noise-added observations.
     
     Arguments:
         traj: [Trajectory] Trajectory instance.
@@ -1880,7 +2487,7 @@ def trajNoiseGenerator(traj, noise_sigma):
 
                 # # sqrt(2)/2*noise in each orthogonal dimension
                 # NOTE: This is a bad way to do it because the estimated fit residuals are already estimated
-                #   in the prependicular direction to the trajectory line
+                #   in the perpendicular direction to the trajectory line
                 # sigma = noise_sigma*np.abs(obs.ang_res_std)/np.sqrt(2.0)
 
                 # # Make sure sigma is positive, if not set it to 1/sqrt(2) degrees
@@ -1922,10 +2529,12 @@ def trajNoiseGenerator(traj, noise_sigma):
             
         # Do not show plots or perform additional optimizations
         traj_mc.verbose = False
-        traj_mc.estimate_timing_vel = True
         traj_mc.filter_picks = False
         traj_mc.show_plots = False
         traj_mc.save_results = False
+
+        # Estimate the timing only if it was estimated in the original solution
+        traj_mc.estimate_timing_vel = traj.estimate_timing_vel
 
         # Return the modified trajectory object
         yield [counter, traj_mc, traj.observations]
@@ -2003,11 +2612,11 @@ def _MCTrajSolve(params):
 
 def monteCarloTrajectory(traj, mc_runs=None, mc_pick_multiplier=1, noise_sigma=1, geometric_uncert=False, \
     plot_results=True, mc_cores=None, max_runs=None):
-    """ Estimates uncertanty in the trajectory solution by doing Monte Carlo runs. The MC runs are done 
+    """ Estimates uncertainty in the trajectory solution by doing Monte Carlo runs. The MC runs are done
         in parallel on all available computer cores.
 
-        The uncertanty is taken as the standard deviation of angular measurements. Each point is sampled 
-        mc_pick_multiplier times using a symetric 2D Gaussian kernel.
+        The uncertainty is taken as the standard deviation of angular measurements. Each point is sampled
+        mc_pick_multiplier times using a symmetric 2D Gaussian kernel.
 
     Arguments:
         traj: [Trajectory object] initial trajectory on which Monte Carlo runs will be performed
@@ -2022,7 +2631,7 @@ def monteCarloTrajectory(traj, mc_runs=None, mc_pick_multiplier=1, noise_sigma=1
             the ones with the better cost function value than the pure geometric solution. Use this when
             the lag is not reliable.
         plot_results: [bool] Plot the trajectory and orbit spread. True by default.
-        mc_cores: [int] Number of CPU cores to use for Monte Carlo parallel procesing. None by default,
+        mc_cores: [int] Number of CPU cores to use for Monte Carlo parallel processing. None by default,
             which means that all available cores will be used.
         max_runs: [int] Maximum number of runs. None by default, which will limit the runs to 10x req_num.
     """
@@ -2082,9 +2691,9 @@ def monteCarloTrajectory(traj, mc_runs=None, mc_pick_multiplier=1, noise_sigma=1
     ##########################################################################################################
 
 
-    # Break the function of there are no trajectories to process
+    # Break the function if there are no trajectories to process
     if len(mc_results) < 2:
-        print('!!! Not enough good Monte Carlo runs for uncertaintly estimation!')
+        print("!!! Not enough good Monte Carlo runs for uncertainty estimation!")
         return traj, None
 
 
@@ -2098,6 +2707,10 @@ def monteCarloTrajectory(traj, mc_runs=None, mc_pick_multiplier=1, noise_sigma=1
     # Assign geometric uncertainty flag, if it was changed
     traj_best.geometric_uncert = geometric_uncert
 
+    # Without timing estimation the noise does not change the velocity, so sample it within its uncertainty
+    if not traj.estimate_timing_vel:
+        mc_results = sampleMCVelocities(mc_results)
+
     print('Computing uncertainties...')
 
     # Calculate the standard deviation of every trajectory parameter
@@ -2105,7 +2718,7 @@ def monteCarloTrajectory(traj, mc_runs=None, mc_pick_multiplier=1, noise_sigma=1
 
     print('Computing covariance matrices...')
 
-    # Calculate orbital and inital state vector covariance matrices (angles in degrees)
+    # Calculate orbital and initial state vector covariance matrices (angles in degrees)
     traj_best.orbit_cov, traj_best.state_vect_cov = calcCovMatrices(mc_results)
 
 
@@ -2361,7 +2974,8 @@ def applyGravityDrop(eci_coord, t, r0, gravity_factor, vz):
 
     Arguments:
         eci_coord: [ndarray] (x, y, z) ECI coordinates of the meteor at the given time t (meters).
-        t: [float] Time of meteor since the beginning of the trajectory.
+        t: [float] Time of meteor since the beginning of the trajectory. Negative before the beginning, where
+            the meteor is below the line too, as the path is a parabola about the beginning.
         r0: [float] Distance from the centre of the Earth of the beginning of the meteor.
         gravity_factor: [float] Factor by which the gravity drop will be multiplied.
         vz: [float] Vertical component of the meteor's velocity.
@@ -2370,9 +2984,6 @@ def applyGravityDrop(eci_coord, t, r0, gravity_factor, vz):
 
     # Define the mass of the Earth
     earth_mass = 5.9722e24 # kg
-
-    # Determing the sign of the initial time
-    time_sign = np.sign(t)
 
     # The derived drop function does not work for small vz's, thus the classical drop function is used
     if abs(vz) < 100:
@@ -2385,7 +2996,7 @@ def applyGravityDrop(eci_coord, t, r0, gravity_factor, vz):
         g = G*earth_mass/r0**2
 
         # Calculate the amount of gravity drop from a straight trajectory
-        drop = time_sign*(1.0/2)*g*t**2
+        drop = (1.0/2)*g*t**2
 
 
     else:
@@ -2399,11 +3010,204 @@ def applyGravityDrop(eci_coord, t, r0, gravity_factor, vz):
             denominator = 1e-10
 
         # Compute the drop using a drop model with a constant vertical velocity
-        drop = time_sign*(G*earth_mass/vz**2)*(r0/denominator + np.log(denominator/r0) - 1)
+        drop = (G*earth_mass/vz**2)*(r0/denominator + np.log(denominator/r0) - 1)
 
 
     # Apply gravity drop to ECI coordinates
     return eci_coord - gravity_factor*drop*vectNorm(eci_coord)
+
+
+
+def applyGravityDrop_vect(eci_coords, t, r0, gravity_factor, vz):
+    """ Apply the gravity drop to many points at once, as applyGravityDrop does to one.
+
+    Arguments:
+        eci_coords: [ndarray] (x, y, z) ECI coordinates of the meteor (meters), one point per row.
+        t: [ndarray] Times of the points since the beginning of the trajectory (s).
+        r0: [ndarray] Distances from the centre of the Earth of the beginning of the meteor, one per point
+            (meters).
+        gravity_factor: [float] Factor by which the gravity drop will be multiplied.
+        vz: [float] Vertical component of the meteor's velocity (m/s).
+
+    Return:
+        [ndarray] ECI coordinates of the points corrected for the gravity drop, one point per row.
+    """
+
+    # Make sure r0 is not 0
+    r0 = np.where(r0 == 0, 1e-10, r0)
+
+    # Use the classical drop function for small vz's
+    if abs(vz) < 100:
+        drop = (1.0/2)*(G*EARTH.MASS/r0**2)*t**2
+
+    # Compute the drop using a drop model with a constant vertical velocity, which is not finite for points
+    #   which are not finite
+    else:
+        denominator = r0 + vz*t
+        denominator = np.where(denominator == 0, 1e-10, denominator)
+
+        with np.errstate(invalid='ignore'):
+            drop = (G*EARTH.MASS/vz**2)*(r0/denominator + np.log(denominator/r0) - 1)
+
+    # Apply gravity drop to ECI coordinates, which are not finite for lines of sight parallel to the line
+    with np.errstate(invalid='ignore'):
+        units = eci_coords/np.linalg.norm(eci_coords, axis=1)[:, None]
+
+    return eci_coords - (gravity_factor*drop)[:, None]*units
+
+
+
+# Number of times at which the gravity drop is tabulated over the trajectory
+GRAVITY_DROP_POINTS = 1001
+
+# Lowest speed of the velocity from which the drag slowing the gravity drop is computed (m/s)
+GRAVITY_DROP_MIN_VEL = 1000.0
+
+# Smallest number of used points to which the drag equation is fitted for the speeds of the gravity drop
+GRAVITY_VEL_MIN_POINTS = 12
+
+
+
+def gravityDropVelocity(time_table, vel, t0, t_drop):
+    """ Take the speed of the meteor at the given times from a table of speeds against time.
+
+    Arguments:
+        time_table: [ndarray] Times of the table, as the times of the observations (s), increasing.
+        vel: [ndarray] Speeds of the table (m/s).
+        t0: [float] Time of the origin of the gravity drop, as the times of the observations (s).
+        t_drop: [ndarray] Times from the origin of the gravity drop (s).
+
+    Return:
+        [ndarray] Speeds at the given times (m/s), the end speeds outside of the table.
+    """
+
+    return np.interp(np.asarray(t_drop, dtype=np.float64) + t0, time_table, vel)
+
+
+
+def gravityDropTable(state_vect, radiant_eci, time_rel, vel, gravity_factor, air_rotation=True):
+    """ Compute the drop of the meteor below the fitted line by gravity at the given times. Only gravity
+        across the path drops the meteor below the line, as gravity along the path changes the speed, which
+        the lengths along the line already have. The drag slows the speed of the drop as it slows the meteor,
+        so the speed across the path follows dw/dt = g_across - (a_drag/v)*w, with the speed and the line
+        tangent to the path at the origin. The air rotates with the Earth, so the drag also pulls the meteor
+        towards the velocity u of the air across the path, as
+        dw/dt = g_across + a_drag/(v - u_along)*(u_across - w).
+
+    Arguments:
+        state_vect: [ndarray] ECI coordinates of the point on the line at the origin of the drop (m).
+        radiant_eci: [ndarray] Unit vector of the radiant in ECI, against the motion.
+        time_rel: [ndarray] Times from the origin of the drop (s), increasing, with one of them 0.
+        vel: [ndarray] Speeds of the meteor at those times (m/s).
+        gravity_factor: [float] Factor by which gravity is multiplied.
+
+    Keyword arguments:
+        air_rotation: [bool] Take the drag against the air which rotates with the Earth into account. If
+            False, the air is at rest in ECI. True by default.
+
+    Return:
+        drop: [ndarray] ECI vectors of the drop at the given times (m), one row per time.
+    """
+
+    time_rel = np.asarray(time_rel, dtype=np.float64)
+    vel = np.maximum(np.asarray(vel, dtype=np.float64), GRAVITY_DROP_MIN_VEL)
+    motion = -vectNorm(np.asarray(radiant_eci, dtype=np.float64))
+
+    # Index of the origin, from which the drop is integrated in both directions
+    i0 = int(np.argmin(np.abs(time_rel)))
+
+    def cumulative(y):
+        """ Integrate the given values over the times with the trapezoidal rule, from 0 at the origin. """
+
+        steps = 0.5*(y[1:] + y[:-1])*np.diff(time_rel).reshape((-1,) + (1,)*(y.ndim - 1))
+        integral = np.concatenate([np.zeros((1,) + y.shape[1:]), np.cumsum(steps, axis=0)])
+
+        return integral - integral[i0]
+
+    # Points along the line, from which gravity is taken
+    points = state_vect + np.outer(cumulative(vel), motion)
+    r = np.linalg.norm(points, axis=1)
+    g = -gravity_factor*G*EARTH.MASS*points/r[:, None]**3
+
+    # Split gravity into the parts along and across the path
+    g_along = np.dot(g, motion)
+    g_across = g - np.outer(g_along, motion)
+
+    # Take the velocity of the air, which rotates with the Earth, at the points along the line
+    air = earthRotationVelocity(points) if air_rotation else np.zeros_like(points)
+    air_along = np.dot(air, motion)
+    air_across = air - np.outer(air_along, motion)
+
+    # The drag decelerates the meteor by the change of the speed, without the gravity along the path, against
+    #   the speed relative to the air
+    drag_rate = np.maximum(g_along - np.gradient(vel, time_rel), 0.0)/np.maximum(vel - air_along, \
+        GRAVITY_DROP_MIN_VEL)
+
+    # Integrate the speed of the drop with the factor by which the drag damps it, and then the drop
+    damping = np.exp(-cumulative(drag_rate))
+    w = damping[:, None]*cumulative((g_across + drag_rate[:, None]*air_across)/damping[:, None])
+    drop = cumulative(w)
+
+    return drop
+
+
+
+def gravityDropOrigin(observations, state_vect, radiant_eci, gravity_vel, t0):
+    """ Compute the point on the line at the origin of the gravity drop, from the first used picks of the used
+        stations moved back to the origin with the speed (see gravityDropReference).
+
+    Arguments:
+        observations: [list] A list of ObservedPoints objects.
+        state_vect: [ndarray] ECI coordinates of a point on the line (m).
+        radiant_eci: [ndarray] Unit vector of the radiant in ECI.
+        gravity_vel: [tuple] Speeds of the meteor against time, see Trajectory.gravity_vel.
+        t0: [float] Time of the origin of the drop (s).
+
+    Return:
+        [ndarray] ECI coordinates of the point (m).
+    """
+
+    v0 = gravityDropVelocity(*gravity_vel, t0, [0.0])[0]
+    eci0, _ = gravityDropReference(observations, state_vect, radiant_eci, v_init=v0)
+
+    return eci0
+
+
+
+def gravityDropVectors(state_vect, radiant_eci, t_drop, gravity_vel, t0, gravity_factor, air_rotation=True):
+    """ Compute the drop of the meteor below the fitted line by gravity at the given times, from a table of
+        its speeds (see gravityDropTable).
+
+    Arguments:
+        state_vect: [ndarray] ECI coordinates of the point on the line at the origin of the drop (m).
+        radiant_eci: [ndarray] Unit vector of the radiant in ECI, against the motion.
+        t_drop: [ndarray] Times from the origin of the drop (s).
+        gravity_vel: [tuple] Times (s) and speeds (m/s) of the meteor, see Trajectory.gravity_vel.
+        t0: [float] Time of the origin of the drop, as the times of the observations (s).
+        gravity_factor: [float] Factor by which gravity is multiplied.
+
+    Keyword arguments:
+        air_rotation: [bool] Take the drag against the air which rotates with the Earth into account (see
+            gravityDropTable). True by default.
+
+    Return:
+        drop: [ndarray] ECI vectors of the drop at the given times (m), one row per time.
+    """
+
+    t_drop = np.atleast_1d(np.asarray(t_drop, dtype=np.float64))
+
+    # There is no drop at the origin
+    if np.all(t_drop == 0):
+        return np.zeros((len(t_drop), 3))
+
+    # Tabulate the drop between the earliest and the latest time, with the origin among the times
+    time_grid = np.union1d(np.linspace(min(np.min(t_drop), 0.0), max(np.max(t_drop), 0.0), \
+        GRAVITY_DROP_POINTS), [0.0])
+    vel = gravityDropVelocity(*gravity_vel, t0, time_grid)
+    drop_grid = gravityDropTable(state_vect, radiant_eci, time_grid, vel, gravity_factor, \
+        air_rotation=air_rotation)
+
+    return np.column_stack([np.interp(t_drop, time_grid, drop_grid[:, i]) for i in range(3)])
 
 
 
@@ -2452,12 +3256,12 @@ class Trajectory(object):
     """ Meteor trajectory solver designed at the University of Western Ontario.
 
     The solver makes a first estimate using the Ceplecha (1987) plane intersection approach, then refines the 
-    solution my miniming the angles between the observed lines of sight and the radiant line. The best 
+    solution by minimizing the angles between the observed lines of sight and the radiant line. The best
     solution is found by adding noise to original measurements and doing Monte Carlo runs to find the 
-    trajectory whose deceleratioins and velocity profiles match the best, as seen from individual stations.
+    trajectory whose decelerations and velocity profiles match the best, as seen from individual stations.
     The initial velocity is estimated from time vs. length by iteratively fitting a line to it and choosing
     the solution with the lowest standard deviation, which should correspond to the part of the trajectory 
-    before the meteor stared to decelerate.
+    before the meteor started to decelerate.
     """
 
 
@@ -2466,11 +3270,12 @@ class Trajectory(object):
         mc_noise_std=1.0, geometric_uncert=False, filter_picks=True, calc_orbit=True, show_plots=True, \
         show_jacchia=False, save_results=True, gravity_correction=True, gravity_factor=1.0, \
         plot_all_spatial_residuals=False, plot_file_type='png', traj_id=None, reject_n_sigma_outliers=3, 
-        mc_cores=None, fixed_times=None, mc_runs_max=None, enable_OSM_plot=False, lowvel=False):
+        mc_cores=None, fixed_times=None, mc_runs_max=None, enable_OSM_plot=False, los_restarts=0, \
+        save_kml=False, kml_measured=False, air_rotation=True, lowvel=False):
         """ Init the Ceplecha trajectory solver.
 
         Arguments:
-            jdt_ref: [float] reference Julian date for the measurements. Add provided times should be given
+            jdt_ref: [float] reference Julian date for the measurements. All provided times should be given
                 relative to this number. This is user selectable and can be the time of the first camera, or 
                 the first measurement, or some average time for the meteor, but should be close to the time of 
                 the meteor. This same reference date/time will be used on all camera measurements for the 
@@ -2480,7 +3285,7 @@ class Trajectory(object):
         Keyword arguments:
             output_dir: [str] Path to the output directory where the Trajectory report and 'pickled' object
                 will be stored.
-            max_toffset: [float] Maximum allowed time offset between cameras in seconds (default 1 second).
+            max_toffset: [float] Maximum allowed time offset between cameras in seconds (default 5 seconds).
             meastype: [float] Flag indicating the type of angle measurements the user is providing for meas1 
                 and meas2 below. The following are all in radians:
                         1 = Right Ascension for meas1, declination for meas2, NOTE: epoch of date, NOT J2000!
@@ -2493,7 +3298,7 @@ class Trajectory(object):
                 data this might be bumped up to 0.5.
             v_init_ht: [float] If given, the initial velocity will be estimated as the average velocity
                 above the given height in kilometers using data from all stations. None by default, in which
-                case the initial velocity will be estimated using the automated siliding fit.
+                case the initial velocity will be estimated using the automated sliding fit.
             estimate_timing_vel: [bool/str] Try to estimate the difference in timing and velocity. True by  
                 default. A string with the list of fixed time offsets can also be given, e.g. 
                 "CA001A":0.42,"CA0005":-0.3.
@@ -2512,21 +3317,34 @@ class Trajectory(object):
             show_jacchia: [bool] Show the Jacchia fit on the plot with meteor dynamics. False by default.
             save_results: [bool] Save results of trajectory estimation to disk. True by default.
             gravity_correction: [bool] Apply the gravity drop when estimating trajectories. True by default.
-            gravity_factor: [flat] Gravity correction factor. 1.0 by default (full correction). 
+            gravity_factor: [float] Gravity correction factor. 1.0 by default (full correction).
                 Can be between 0 - 1. Lower values used for lift compensation.
             plot_all_spatial_residuals: [bool] Plot all spatial residuals on one plot (one vs. time, and
                 the other vs. length). False by default.
-            plot_file_type: [str] File extansion of the plot image. 'png' by default, can be 'pdf', 'eps', ...
+            plot_file_type: [str] File extension of the plot image. 'png' by default, can be 'pdf', 'eps', ...
             traj_id: [str] Trajectory solution identifier. None by default.
-            reject_n_sigma_outliers: [float] Reject angular outliers that are n sigma outside the fit.
-                This value is 3 (sigma) by default.
-            mc_cores: [int] Number of CPU cores to use for Monte Carlo parallell processing. None by default,
+            reject_n_sigma_outliers: [float] Reject angular outliers whose residual is above the mean plus n
+                times the RMS of the residuals of the used picks. This value is 3 (sigma) by default.
+            mc_cores: [int] Number of CPU cores to use for Monte Carlo parallel processing. None by default,
                 which means that all cores will be used.
             fixed_times: [dict] Dictionary of fixed times for each station. None by default, meaning that
                 all stations will be estimated. Only used if estimate_timing_vel is True.
             mc_runs_max: [int] Maximum number of Monte Carlo runs. None by default, which will limit the runs
                 to 10x req_num.
             enable_OSM_plot: [bool] plot the ground track using OS maps as well as the default 
+            los_restarts: [int] Number of times the Nelder-Mead minimization of the line-of-sight fit is
+                restarted from its own solution. 0 by default. The fit mixes meters with the components of a
+                unit vector, so the simplex can stall short of the minimum by up to a few arcseconds. One
+                restart brings it closer, at about 40% more CPU time per solution, but it does not change the
+                error against the truth, which the noise sets. Only use it when the last fraction of an
+                arcsecond matters, e.g. when comparing solutions of the same event.
+            save_kml: [bool] Save a 3D KML of the solution with the original picks (*_3D.kml) with the
+                trajectory of the drag fit, see Utils.TrajectoryKML.trajectoryToKML(). False by default.
+            kml_measured: [bool] Add the projected points, lines of sight and residuals of the measurements to
+                the 3D KML. False by default.
+            air_rotation: [bool] Take the drag against the air, which rotates with the Earth, into account in
+                the gravity drop across the path (see gravityDropTable). True by default. If False, the air
+                is at rest in ECI.
             lowvel: [bool] Restric the range to lower velocities and ignore the check for computable geocentric orbit
 
         """
@@ -2542,10 +3360,10 @@ class Trajectory(object):
 
         # Maximum time offset between cameras
         if max_toffset is None:
-            max_toffset = 1.0
+            max_toffset = 5.0
         self.max_toffset = max_toffset
 
-        # If verbose True, results and status messages will be printed out, otherwise they will be supressed
+        # If verbose True, results and status messages will be printed out, otherwise they will be suppressed
         self.verbose = verbose
 
         # If lowvel True, velocities higher than 12 km/s will be rejected and trajectories that have non-computable geocentric orbits will be allowed
@@ -2563,12 +3381,14 @@ class Trajectory(object):
 
         # Estimating the difference in timing between stations, and the initial velocity if this flag is True
         self.fixed_time_offsets = {}
+        self.fixed_time_offsets_copy = {}
         if isinstance(estimate_timing_vel, str):
 
             # If a list of fixed timing offsets was given, parse it into a dictionary
             for entry in estimate_timing_vel.split(','):
                 station, offset = entry.split(":")
                 self.fixed_time_offsets[station] = float(offset)
+                self.fixed_time_offsets_copy[station] = float(offset)
 
             print("Fixed timing given:", self.fixed_time_offsets)
 
@@ -2587,10 +3407,12 @@ class Trajectory(object):
             if estimate_timing_vel:
 
                 self.fixed_time_offsets = {}
+                self.fixed_time_offsets_copy = {}
 
                 for entry in self.fixed_times.split(','):
                     station, offset = entry.split(":")
                     self.fixed_time_offsets[station] = float(offset)
+                    self.fixed_time_offsets_copy[station] = float(offset)
 
 
         # Running Monte Carlo simulations to estimate uncertainties
@@ -2611,6 +3433,9 @@ class Trajectory(object):
         # Enable OSM plot if required
         self.enable_OSM_plot = enable_OSM_plot         
 
+        # Number of restarts of the line-of-sight minimization
+        self.los_restarts = los_restarts
+
         # If True, pure geometric uncertainties will be computed and culling of solutions based on cost
         #   function value will not be done
         self.geometric_uncert = geometric_uncert
@@ -2630,8 +3455,15 @@ class Trajectory(object):
         # Save results to disk if true
         self.save_results = save_results
 
+        # Save a 3D KML with the results, optionally with the measurements
+        self.save_kml = save_kml
+        self.kml_measured = kml_measured
+
         # Apply the correction for gravity when estimating the trajectory
         self.gravity_correction = gravity_correction
+
+        # Take the drag against the rotating air into account in the gravity drop
+        self.air_rotation = air_rotation
 
         # Gravity correction factor, limit to 0 - 1
         self.gravity_factor = gravity_factor
@@ -2669,7 +3501,7 @@ class Trajectory(object):
         # List of observations
         self.observations = []
 
-        # Minimization status - if True if LoS angle minimization is successfull, False otherwise
+        # Minimization status - if True if LoS angle minimization is successful, False otherwise
         self.los_mini_status = False
 
         # Index of the station with the reference time
@@ -2713,7 +3545,7 @@ class Trajectory(object):
         # Initial state vector (minimization)
         self.state_vect_mini = None
 
-        # Radiant in ECi and equatorial coordinatrs (minimiziation)
+        # Radiant in ECI and equatorial coordinates (minimization)
         self.radiant_eci_mini = None
         self.radiant_eq_mini = None
 
@@ -2722,6 +3554,18 @@ class Trajectory(object):
 
         # V0z (vertical component of the initial velocity)
         self.v0z = None
+
+        # Distance of the beginning of the meteor from the centre of the Earth, fixed for the gravity pass of
+        #   the line-of-sight fit (see gravityDropReference)
+        self.gravity_r0 = None
+
+        # Time from which the gravity drop is computed (s), see dropTimeOrigin
+        self.gravity_t0 = None
+
+        # Speeds of the meteor against time from the pass before the gravity pass, with which the gravity drop
+        #   is computed across the path and slowed by the drag: times, as the times of the observations (s),
+        #   and speeds (m/s)
+        self.gravity_vel = None
 
         # Calculated average velocity
         self.v_avg = None
@@ -2760,7 +3604,7 @@ class Trajectory(object):
         # Initial state vector covariance matrix
         self.state_vect_cov = None
 
-        # flag to indicate whether only phase 1 solving ha been run
+        # Flag to indicate whether only phase 1 solving has been run
         # default False to handle existing trajectory data
         self.phase_1_only = False
 
@@ -2772,7 +3616,8 @@ class Trajectory(object):
 
 
     def infillTrajectory(self, meas1, meas2, time_data, lat, lon, ele, station_id=None, excluded_time=None,
-        ignore_list=None, magnitudes=None, fov_beg=None, fov_end=None, obs_id=None, comment='', ignore_station=False):
+        ignore_list=None, magnitudes=None, fov_beg=None, fov_end=None, obs_id=None, comment='', ignore_station=False,
+        radec_jd=None):
         """ Initialize a set of measurements for a given station. 
     
         Arguments:
@@ -2802,6 +3647,8 @@ class Trajectory(object):
                 the same station.
             comment: [str] A comment about the observations. May be used to store RMS FF file number on which
                 the meteor was observed.
+            radec_jd: [ndarray] Julian date at which each R.A./Dec. was computed, when meastype is 1. See
+                ObservedPoints. None by default (all at jdt_ref, the CAMS convention).
         Return:
             None
         """
@@ -2833,7 +3680,7 @@ class Trajectory(object):
             obs_id = self.meas_count
 
 
-        # Convert measuremet lists to numpy arrays
+        # Convert measurement lists to numpy arrays
         meas1 = np.array(meas1)
         meas2 = np.array(meas2)
         time_data = np.array(time_data)
@@ -2841,6 +3688,12 @@ class Trajectory(object):
         # Add a fixed offset to time data if given
         if str(station_id) in self.fixed_time_offsets:
             time_data += self.fixed_time_offsets[str(station_id)]
+
+            # Make a copy of the fixed offset values for output display purposes.
+            self.fixed_time_offsets_copy[str(station_id)] = self.fixed_time_offsets[str(station_id)]
+
+            # set the original value to zero as it has already been applied.
+            self.fixed_time_offsets[str(station_id)] = 0
 
         # Skip the observation if all points were ignored
         if ignore_list is not None:
@@ -2851,7 +3704,8 @@ class Trajectory(object):
         # Init a new structure which will contain the observed data from the given site
         obs = ObservedPoints(self.jdt_ref, meas1, meas2, time_data, lat, lon, ele, station_id=station_id, 
             meastype=self.meastype, excluded_time=excluded_time, ignore_list=ignore_list, ignore_station=ignore_station, 
-            magnitudes=magnitudes, fov_beg=fov_beg, fov_end=fov_end, obs_id=obs_id, comment=comment)
+            magnitudes=magnitudes, fov_beg=fov_beg, fov_end=fov_end, obs_id=obs_id, comment=comment,
+            radec_jd=radec_jd)
             
         # Add observations to the total observations list
         self.observations.append(obs)
@@ -2866,12 +3720,20 @@ class Trajectory(object):
             obs: [ObservedPoints] Instance of ObservedPoints.
 
         Keyword arguments:
-            meastype: [int] Measurement type. If not given, it will be read from the trajectory object.
+            meastype: [int] Measurement type. If not given, it will be read from the trajectory object. Only
+                then are the times at which the R.A./Dec. were computed (radec_jd) kept, as obs.ra_data is
+                recomputed at jdt_ref.
         """
+
+        # Only the original measurements carry the times their R.A./Dec. were computed at
+        radec_jd = None
 
         if meastype is None:
             meas1 = obs.meas1
             meas2 = obs.meas2
+
+            # Observations pickled before radec_jd existed were all computed at jdt_ref
+            radec_jd = getattr(obs, 'radec_jd', None)
 
 
         # If inputs were RA and Dec
@@ -2898,7 +3760,7 @@ class Trajectory(object):
             meas2 = np.pi/2.0 - obs.elev_data
 
 
-        ### PRESERVE COMPATBILITY WITH OLD obs OBJECTS ###
+        ### PRESERVE COMPATIBILITY WITH OLD obs OBJECTS ###
 
         # Check if the observation had any excluded points
         if hasattr(obs, 'excluded_time'):
@@ -2910,7 +3772,7 @@ class Trajectory(object):
         if hasattr(obs, 'ignore_list'):
             ignore_list = obs.ignore_list
 
-            # If the ignore list differens in length from time data, reinit
+            # If the ignore list difference in length from time data, reinit
             if len(ignore_list) != len(obs.time_data):
                 ignore_list = np.zeros(len(obs.time_data), dtype=np.uint8)
 
@@ -2944,7 +3806,7 @@ class Trajectory(object):
         self.infillTrajectory(meas1, meas2, obs.time_data, obs.lat, obs.lon, obs.ele, \
             station_id=obs.station_id, excluded_time=excluded_time, ignore_list=ignore_list, \
             magnitudes=magnitudes, fov_beg=obs.fov_beg, fov_end=obs.fov_end, obs_id=obs.obs_id, \
-            comment=obs.comment, ignore_station=obs.ignore_station)
+            comment=obs.comment, ignore_station=obs.ignore_station, radec_jd=radec_jd)
 
 
 
@@ -2962,6 +3824,9 @@ class Trajectory(object):
 
         """
 
+        # The same beginning point for the gravity drop as the line-of-sight fit
+        _, r0 = gravityDropReference(observations, state_vect, radiant_eci, v_init=self.v_init)
+
         # Go though observations from all stations
         for obs in observations:
 
@@ -2969,12 +3834,19 @@ class Trajectory(object):
             obs.h_residuals = []
             obs.v_residuals = []
 
+            # Compute the drop across the path at the times of the points, from the same origin as the
+            #   line-of-sight fit, if the speeds are known
+            drops = self.dropAcrossPath(observations, obs, state_vect, radiant_eci, \
+                dropTimeOrigin(observations)) if self.gravity_correction else None
+
             # Go through all individual position measurement from each site
-            for t, jd, stat, meas in zip(obs.time_data, obs.JD_data, obs.stat_eci_los, obs.meas_eci_los):
+            for i, (t, jd, stat, meas) in enumerate(zip(obs.time_data, obs.JD_data, obs.stat_eci_los, \
+                obs.meas_eci_los)):
 
                 # Calculate horizontal and vertical residuals
                 hres, vres = calcSpatialResidual(self.jdt_ref, jd, state_vect, radiant_eci, stat, meas, \
-                    gravity=self.gravity_correction, gravity_factor=self.gravity_factor, v0z=self.v0z)
+                    gravity=self.gravity_correction, gravity_factor=self.gravity_factor, v0z=self.v0z, \
+                    r0=r0, drop=(drops[i] if drops is not None else None))
 
                 # Add residuals to the residual list
                 obs.h_residuals.append(hres)
@@ -2994,7 +3866,7 @@ class Trajectory(object):
                 obs.model_azim)
 
 
-            # Calculate the standard deviaton of angular residuals in radians, taking the ignored points into
+            # Calculate the standard deviation of angular residuals in radians, taking the ignored points into
             #   account
             if not obs.ignore_station:
                 obs.ang_res_std = RMSD(obs.ang_res[obs.ignore_list == 0])
@@ -3005,7 +3877,8 @@ class Trajectory(object):
 
 
 
-    def calcVelocity(self, state_vect, radiant_eci, observations, weights, calc_res=False):
+    def calcVelocity(self, state_vect, radiant_eci, observations, weights, calc_res=False, gravity=False, \
+        calc_lengths=True):
         """ Calculates point to point velocity for the given solution, as well as the average velocity 
             including all previous points up to the given point.
 
@@ -3020,41 +3893,76 @@ class Trajectory(object):
         Keyword arguments:
             calc_res: [bool] If True, the cost of lag residuals will be calculated. The timing offsets first 
                 need to be calculated for this to work.
+            gravity: [bool] Find the points on the gravity-dropped trajectory, as the line-of-sight fit does
+                when it applies the drop. False by default.
+            calc_lengths: [bool] Compute the lengths along the trail. If False, the lengths of the previous
+                call are kept, e.g. the ones the velocity and the timing offsets were fitted to. True by
+                default.
 
         """
 
+        # Same reference time and beginning point as the line-of-sight fit
+        t0 = dropTimeOrigin(observations)
+        if gravity:
+            r0 = self.gravity_r0
+            if r0 is None:
+                _, r0 = gravityDropReference(observations, state_vect, radiant_eci, v_init=self.v_init)
 
         # Go through observations from all stations
         for obs in observations:
 
-            # List of distances from the first trajectory point on the radiant line
-            first_pt_distances = []
+            # Compute the lengths along the trail, unless the ones from the previous call are kept
+            if calc_lengths:
 
-            # List of distances from the state vector
-            state_vect_dist = []
+                # List of distances from the first trajectory point on the radiant line
+                first_pt_distances = []
 
-            # Go through all individual position measurement from each site
-            for i, (stat, meas) in enumerate(zip(obs.stat_eci_los, obs.meas_eci_los)):
+                # List of distances from the state vector
+                state_vect_dist = []
 
-                # Calculate closest points of approach (observed line of sight to radiant line)
-                obs_cpa, rad_cpa, d = findClosestPoints(stat, meas, state_vect, radiant_eci)
+                # Compute the drop across the path at the times of the points, if the speeds are known
+                drops = self.dropAcrossPath(observations, obs, state_vect, radiant_eci, t0) \
+                    if gravity else None
 
-                # Take the position of the first point as the reference point
-                if i == 0:
-                    ref_point = np.copy(rad_cpa)
+                # Go through all individual position measurement from each site
+                for i, (t, stat, meas) in enumerate(zip(obs.time_data, obs.stat_eci_los, obs.meas_eci_los)):
 
-                # Calculate the distance from the first observed point to the projected point on the radiant line
-                dist = vectMag(ref_point - rad_cpa)
+                    # Calculate closest points of approach (observed line of sight to radiant line)
+                    obs_cpa, rad_cpa, d = findClosestPoints(stat, meas, state_vect, radiant_eci)
+
+                    # Find the point on the gravity-dropped trajectory the same way as the line-of-sight fit,
+                    #   and move the projected point along the radiant line by the same length
+                    if gravity:
+
+                        v0z = self.v0z
+                        if v0z is None:
+                            v0z = 0.0
+
+                        if drops is not None:
+                            rad_cpa_grav = rad_cpa + drops[i]
+                        else:
+                            rad_cpa_grav = applyGravityDrop(rad_cpa, t - t0, r0, self.gravity_factor, v0z)
+                        _, rad_cpa_dropped, _ = findClosestPoints(stat, meas, rad_cpa_grav, radiant_eci)
+                        rad_cpa = rad_cpa + rad_cpa_dropped - rad_cpa_grav
+
+                    # Take the position of the first point as the reference point
+                    if i == 0:
+                        ref_point = np.copy(rad_cpa)
+
+                    # Calculate the distance from the first observed point to the projected point on the
+                    #   radiant line
+                    dist = vectMag(ref_point - rad_cpa)
                 
-                first_pt_distances.append(dist)
+                    first_pt_distances.append(dist)
 
-                # Distance from the state vector to the projected point on the radiant line
-                state_vect_dist.append(vectMag(state_vect - rad_cpa))
+                    # Distance from the state vector to the projected point on the radiant line, negative for
+                    #   a point before the state vector
+                    state_vect_dist.append(np.dot(state_vect - rad_cpa, radiant_eci))
 
 
-            # Convert the distances (length along the trail) into a numpy array
-            obs.length = np.array(first_pt_distances)
-            obs.state_vect_dist = np.array(state_vect_dist)
+                # Convert the distances (length along the trail) into a numpy array
+                obs.length = np.array(first_pt_distances)
+                obs.state_vect_dist = np.array(state_vect_dist)
 
 
             ### Calculate average velocity including all points up to the given point ###
@@ -3084,7 +3992,7 @@ class Trajectory(object):
                     try:
                         popt, _ = scipy.optimize.curve_fit(lineFunc, time_part, len_part)
 
-                    # Check for this fit error, which happens extrememly rarely:
+                    # Check for this fit error, which happens extremely rarely:
                     # RuntimeError: Optimal parameters not found: gtol=0.000000 is too small, func(x) is 
                     # orthogonal to the columns of the Jacobian to machine precision.
                     except RuntimeError:
@@ -3171,12 +4079,13 @@ class Trajectory(object):
             weights: [list] A list of statistical weights for every station.
     
         Return:
-            (v_ht_avg, intercept): 
+            (v_ht_avg, intercept, v_ht_stddev):
                 v_ht_avg: [float] Average velocity above the given height (m/s).
                 intercept: [float] Fit intercept (m).
+                v_ht_stddev: [float] Standard deviation of the average velocity (m/s).
         """
 
-        # Maker sure weight values are OK
+        # Make sure weight values are OK
         weights = checkWeights(observations, weights)
 
         # Construct arrays of times vs. distance from state vector
@@ -3217,13 +4126,17 @@ class Trajectory(object):
         if len(all_times) < 4:
             print('!!! Error, there are less than 4 points for velocity estimation above the given height of {:.2f} km!'.format(bottom_ht/1000))
             print('Using automated velocity estimation with the sliding fit...')
-            return None, None
+            return None, None, None
+
+        # Take off the length gained from gravity along the path, so the slope is the velocity at the beginning
+        all_state_vect_dists = np.array(all_state_vect_dists) \
+            - self.gravityLengthAlongPath(observations, np.array(all_times))
 
         # Fit a line through the time vs. state vector distance data
-        line_params, _ = scipy.optimize.curve_fit(lineFunc, all_times, all_state_vect_dists, \
+        line_params, line_cov = scipy.optimize.curve_fit(lineFunc, all_times, all_state_vect_dists, \
             sigma=all_inv_weights)
 
-        return line_params
+        return line_params[0], line_params[1], np.sqrt(line_cov[0, 0])
 
 
 
@@ -3236,7 +4149,7 @@ class Trajectory(object):
                 stations.
 
         Keyword arguments:
-            velocity_fit: [tuple of float] Initial velocity and fit intercept (m/s and m). None by defualt.
+            velocity_fit: [tuple of float] Initial velocity and fit intercept (m/s and m). None by default.
 
         """
 
@@ -3253,29 +4166,35 @@ class Trajectory(object):
                 if init_part_size < 4:
                     init_part_size = len(obs.time_data)
 
-                # Cut the length and time to the first quarter
-                quart_length = obs.length[:init_part_size]
+                # Cut the length and time to the first quarter, without the length gained from gravity along
+                #   the path, so that the slope is the velocity at the beginning
                 quart_time = obs.time_data[:init_part_size]
+                quart_length = obs.length[:init_part_size] \
+                    - self.gravityLengthAlongPath(observations, quart_time)
 
-                # Fit a line to the data, estimate the velocity
+                # Fit a line to the data, estimate the velocity and its standard deviation
                 try:
-                    obs.lag_line, _ = scipy.optimize.curve_fit(lineFunc, quart_time, quart_length)
+                    obs.lag_line, lag_line_cov = scipy.optimize.curve_fit(lineFunc, quart_time, quart_length)
+                    obs.v_init_stddev = np.sqrt(lag_line_cov[0, 0])
 
                 # Handle this error:
                 # RuntimeError: Optimal parameters not found: gtol=0.000000 is too small, func(x) is orthogonal to the columns of
                 #   the Jacobian to machine precision.
                 except RuntimeError:
                     obs.lag_line = [0, 0]
+                    obs.v_init_stddev = None
 
                 # Calculate lag
-                obs.lag = obs.length - lineFunc(obs.time_data, *obs.lag_line)
+                obs.lag = obs.length - self.gravityLengthAlongPath(observations, obs.time_data) \
+                    - lineFunc(obs.time_data, *obs.lag_line)
 
             else:
                 
                 obs.lag_line = list(velocity_fit)
 
                 # Calculate lag
-                obs.lag = obs.state_vect_dist - lineFunc(obs.time_data, *obs.lag_line)
+                obs.lag = obs.state_vect_dist - self.gravityLengthAlongPath(observations, obs.time_data) \
+                    - lineFunc(obs.time_data, *obs.lag_line)
 
 
             # Initial velocity is the slope of the fitted line
@@ -3334,7 +4253,8 @@ class Trajectory(object):
 
 
 
-    def estimateTimingAndVelocity(self, observations, weights, estimate_timing_vel=True):
+    def estimateTimingAndVelocity(self, observations, weights, estimate_timing_vel=True, \
+        _timing_only=False, _max_toffset=None):
         """ Estimates time offsets between the stations by matching time vs. distance from state vector. 
             The initial velocity is calculated by ineratively fitting a line from the beginning to 20% of the 
             total trajectory, and up to the 80% of the total trajectory. The fit with the lowest standard
@@ -3348,6 +4268,12 @@ class Trajectory(object):
         Keyword arguments:
             estimate_timing_vel: [bool] If True (default), the time differences and the velocity will be 
                 estimated, otherwise the velocity will be estimated as the medial velocity.
+
+        Keyword arguments (internal flags, DO NOT SPECIFY MANUALLY!):
+            _timing_only: [bool] Internal flag. If True, only the time offsets are estimated, without ignoring
+                the stations whose offset is at the limit and without fitting the velocity. False by default.
+            _max_toffset: [float] Internal flag. Maximum time offset used instead of max_toffset (s). None by
+                default.
 
         Return:
             (fit_success, velocity_fit, v_init_mini, time_diffs, observations): [tuple]
@@ -3369,7 +4295,15 @@ class Trajectory(object):
         time_diffs = np.zeros(len(observations))
 
         if not estimate_timing_vel:
-            return True, np.zeros(2), v_init, 0, time_diffs, observations
+
+            # Compute the timing residual with the given clocks (fixed offsets are already applied)
+            fixed_time_dict = {str(obs.station_id): 0.0 for obs in observations}
+            self.timing_res = timingResiduals(np.zeros(1), observations, fixed_time_dict, weights=weights)
+
+            # Compute the standard deviation of the median velocity from the fits of individual stations
+            vel_stddev = medianStddev([obs.v_init_stddev for obs in observations if obs.v_init is not None])
+
+            return True, np.zeros(2), v_init, vel_stddev, time_diffs, observations
 
         # Run timing offset estimation if it needs to be done
         if estimate_timing_vel:
@@ -3379,23 +4313,31 @@ class Trajectory(object):
             # - if the time is fixed, a number is given
             # - if the time is to be estimated, True is set
             self.stations_time_dict = collections.OrderedDict()
+            self.stations_time_dict_copy = collections.OrderedDict()
             station_list = [str(obs.station_id) for obs in observations]
             for obs in observations:
                 if str(obs.station_id) in self.fixed_time_offsets:
                     self.stations_time_dict[str(obs.station_id)] = self.fixed_time_offsets[str(obs.station_id)]
+                    self.stations_time_dict_copy[str(obs.station_id)] = self.fixed_time_offsets_copy[str(obs.station_id)]
                 else:
                     self.stations_time_dict[str(obs.station_id)] = True
+                    self.stations_time_dict_copy[str(obs.station_id)] = True
 
-            # If no fixed times are given, set the station with the longest track as the reference station
-            #   (time difference = 0)
+            # If no fixed times are given, set the used station with the longest track as the reference
+            #   station (time difference = 0)
             if len(self.fixed_time_offsets) == 0:
-                obs_points = [obs.kmeas for obs in observations]
+                obs_points = [0 if obs.ignore_station else obs.kmeas for obs in observations]
                 ref_index = obs_points.index(max(obs_points))
                 self.stations_time_dict[station_list[ref_index]] = 0
+                self.stations_time_dict_copy[station_list[ref_index]] = 0
                 
             
             # Generate an initial guess for stations which have no fixed time
             p0 = np.zeros(len([val for val in self.stations_time_dict.values() if val is True]))
+
+            # If all stations are supplied with a time offset value, set them all to zero
+            if len([val for val in self.stations_time_dict.values() if val is True]) == 0:
+                p0 = np.zeros(1)
             
 
             if self.verbose:
@@ -3403,11 +4345,11 @@ class Trajectory(object):
                                                                       self.stations_time_dict, 
                                                                       weights=weights))
 
-
             # Set bounds for timing to +/- given maximum time offset
+            max_toffset = self.max_toffset if _max_toffset is None else _max_toffset
             bounds = []
             for i in range(len(p0)):
-                bounds.append([-self.max_toffset, self.max_toffset])
+                bounds.append([-max_toffset, max_toffset])
 
 
             ### Try different methods of optimization until it is successful ##
@@ -3449,6 +4391,103 @@ class Trajectory(object):
 
             ### ###
 
+
+            # Ignore a station whose clock needs a larger time offset than allowed and estimate the timing
+            #   again without it, so that the other stations are not pulled towards it
+            if timing_mini.success and (not _timing_only) and (numStationsNotIgnored(observations) > 2):
+
+                # Take the estimated time offset of every station
+                time_offsets = np.zeros(len(observations))
+                estimated_indices = [i for i, obs in enumerate(observations) \
+                    if isinstance(self.stations_time_dict[str(obs.station_id)], bool)]
+                time_offsets[estimated_indices] = timing_mini.x[:len(estimated_indices)]
+
+                if numOffsetsAtLimit(observations, self.stations_time_dict, time_offsets, self.max_toffset):
+
+                    # Keep the timing state, which the estimations below overwrite
+                    stations_time_dict = self.stations_time_dict
+                    stations_time_dict_copy = self.stations_time_dict_copy
+                    timing_res = self.timing_res
+
+                    # Estimate only the timing with twice the maximum time offset, on a copy of the
+                    #   observations, to check if an offset at the limit really needs to be larger
+                    wide_observations = copy.deepcopy(observations)
+                    wide_results = self.estimateTimingAndVelocity(wide_observations, weights, \
+                        estimate_timing_vel=estimate_timing_vel, _timing_only=True, \
+                        _max_toffset=2*self.max_toffset)
+                    wide_offsets = [t_diff for obs, t_diff in zip(wide_observations, wide_results[4]) \
+                        if (not obs.ignore_station) \
+                        and isinstance(self.stations_time_dict[str(obs.station_id)], bool)]
+
+                    # Look for a station to ignore only if an offset is beyond the limit by more than 10%, as
+                    #   the lines of sight of a station whose clock is off bias its offset in the first pass
+                    search_indices = []
+                    if wide_results[0] and np.any(np.abs(wide_offsets) > 1.1*self.max_toffset):
+                        search_indices = [i for i, obs in enumerate(observations) \
+                            if (not obs.ignore_station) \
+                            and (str(obs.station_id) not in self.fixed_time_offsets)]
+
+                    best_index = None
+                    best_timing_res = np.inf
+
+                    # Find the pairs of used stations whose times are compared
+                    compared_pairs = comparedStationPairs(observations, weights=weights)
+
+                    # Estimate only the timing without each used station whose offset is not fixed, on a copy
+                    #   of the observations
+                    for i in search_indices:
+
+                        obs = observations[i]
+
+                        # Skip the station if without it the other used stations are not one group linked by
+                        #   compared times, as the clocks of separate groups are not tied together
+                        other_indices = [j for j, other_obs in enumerate(observations) \
+                            if (j != i) and (not other_obs.ignore_station)]
+                        if not isGraphConnected(other_indices, compared_pairs):
+                            continue
+
+                        trial_observations = copy.deepcopy(observations)
+                        trial_observations[i].ignore_station = True
+                        trial_observations[i].ignore_list = np.ones(len(obs.time_data), dtype=np.uint8)
+
+                        trial_results = self.estimateTimingAndVelocity(trial_observations, weights, \
+                            estimate_timing_vel=estimate_timing_vel, _timing_only=True)
+
+                        # Skip the station if the timing fails without it
+                        if not trial_results[0]:
+                            continue
+
+                        # Skip the station if an offset is still at the limit
+                        if numOffsetsAtLimit(trial_observations, self.stations_time_dict, trial_results[4], \
+                            self.max_toffset):
+                            continue
+
+                        # Choose the station without which the timing residual is the lowest
+                        if self.timing_res < best_timing_res:
+                            best_index = i
+                            best_timing_res = self.timing_res
+
+
+                    # Restore the timing state
+                    self.stations_time_dict = stations_time_dict
+                    self.stations_time_dict_copy = stations_time_dict_copy
+                    self.timing_res = timing_res
+
+                    # Ignore the chosen station and estimate the timing again without it
+                    if best_index is not None:
+
+                        off_obs = observations[best_index]
+                        off_obs.ignore_station = True
+                        off_obs.ignore_list = np.ones(len(off_obs.time_data), dtype=np.uint8)
+
+                        if self.verbose:
+                            print("Station {:s} ignored, its clock is off by more than {:.2f} s".format(\
+                                str(off_obs.station_id), self.max_toffset))
+
+                        return self.estimateTimingAndVelocity(observations, weights, \
+                            estimate_timing_vel=estimate_timing_vel)
+
+
             if not timing_mini.success:
 
                 print('Timing difference and initial velocity minimization failed with the message:')
@@ -3481,18 +4520,31 @@ class Trajectory(object):
                 # Check the station timing dictionary to see if the station is fixed
                 stat_status = self.stations_time_dict[str(obs.station_id)]
 
+                # Make a copy of the time offset from the original values stored before they were zeroed.
+                stat_status_copy = self.stations_time_dict_copy[str(obs.station_id)]
+
                 # If the station has a fixed time offset, read it
                 if not isinstance(stat_status, bool):
                     t_diff = stat_status
+                    t_diff_copy = stat_status_copy
+
+                    # Add the final time difference of the site to the list
+                    time_diffs[i] = t_diff_copy
+
+                    if self.verbose:
+                        print('STATION ' + str(obs.station_id) + ' TIME OFFSET = ' + str(t_diff_copy) + ' s (fixed offset applied)')
 
                 # Otherwise read the estimated offset
                 else:
                     t_diff = timing_mini.x[stat_count]
                     stat_count += 1
 
+                    # Add the final time difference of the site to the list
+                    time_diffs[i] = t_diff
 
-                if self.verbose:
-                    print('STATION ' + str(obs.station_id) + ' TIME OFFSET = ' + str(t_diff) + ' s')
+                    if self.verbose:
+                        print('STATION ' + str(obs.station_id) + ' TIME OFFSET = ' + str(t_diff) + ' s')
+
 
                 # Skip NaN and inf time offsets
                 if np.isnan(t_diff) or np.isinf(t_diff):
@@ -3505,9 +4557,11 @@ class Trajectory(object):
                 if obs.excluded_time is not None:
                     obs.excluded_time = [ex_time + t_diff for ex_time in obs.excluded_time]
 
-                # Add the final time difference of the site to the list
-                time_diffs[i] = t_diff
 
+            # Return only the time offsets if the velocity is not to be fitted
+            if _timing_only:
+                return timing_minimization_successful, np.zeros(2), v_init, vel_stddev, time_diffs, \
+                    observations
 
 
             # Add in time and distance points, excluding the ignored points
@@ -3533,6 +4587,10 @@ class Trajectory(object):
             times = times[time_sort_ind]
             state_vect_dist = state_vect_dist[time_sort_ind]
             weight_list = weight_list[time_sort_ind]
+
+            # Fit the velocity without the length gained from gravity along the path, so that the slope is the
+            #   velocity at the beginning and the lag is the deceleration by the air
+            state_vect_dist = state_vect_dist - self.gravityLengthAlongPath(observations, times)
 
 
             stddev_list = []
@@ -3636,7 +4694,8 @@ class Trajectory(object):
 
                 # Calculate the lag for every site
                 for obs in observations:
-                    obs.lag = obs.state_vect_dist - lineFunc(obs.time_data, *velocity_fit)
+                    obs.lag = obs.state_vect_dist - self.gravityLengthAlongPath(observations, obs.time_data) \
+                        - lineFunc(obs.time_data, *velocity_fit)
 
 
 
@@ -3648,6 +4707,159 @@ class Trajectory(object):
 
         return timing_minimization_successful, velocity_fit, v_init_mini, vel_stddev, time_diffs, observations
 
+
+
+
+    def gravityAlongPath(self):
+        """ Compute the acceleration of the meteor along its path by gravity, at the beginning of the line of
+            the last solution.
+
+        Return:
+            [float] Acceleration along the path (m/s^2), 0 without the gravity correction or a solution.
+        """
+
+        state_vect = getattr(self, 'state_vect_mini', None)
+        radiant_eci = getattr(self, 'radiant_eci_mini', None)
+
+        if (not self.gravity_correction) or (state_vect is None) or (radiant_eci is None):
+            return 0.0
+
+        motion = -vectNorm(radiant_eci)
+
+        return -self.gravity_factor*G*EARTH.MASS*np.dot(state_vect, motion)/vectMag(state_vect)**3
+
+
+
+    def gravityLengthAlongPath(self, observations, times):
+        """ Compute the length the meteor gained along its path from gravity since the origin of the gravity
+            drop, which is taken out before the velocity is fitted to the lengths.
+
+        Arguments:
+            observations: [list] A list of ObservedPoints objects.
+            times: [ndarray] Times of the points (s).
+
+        Return:
+            [ndarray] Lengths gained from gravity (m).
+        """
+
+        t0 = dropTimeOrigin(observations)
+
+        return 0.5*self.gravityAlongPath()*(np.asarray(times, dtype=np.float64) - t0)**2
+
+
+
+    def dropAcrossPath(self, observations, obs, state_vect, radiant_eci, t0):
+        """ Compute the gravity drop across the path at the times of the points of one station, if the speeds
+            of the meteor are known (see gravityDropTable).
+
+        Arguments:
+            observations: [list] A list of ObservedPoints objects.
+            obs: [ObservedPoints object] Station whose points are dropped.
+            state_vect: [ndarray] (x, y, z) ECI coordinates of a point on the line (m).
+            radiant_eci: [ndarray] Unit vector of the radiant in ECI.
+            t0: [float] Time of the origin of the drop (s).
+
+        Return:
+            [ndarray] ECI vectors of the drop (m), one row per point, or None without the speeds.
+        """
+
+        if getattr(self, 'gravity_vel', None) is None:
+            return None
+
+        return gravityDropVectors(gravityDropOrigin(observations, state_vect, radiant_eci, self.gravity_vel, \
+            t0), radiant_eci, obs.time_data - t0, self.gravity_vel, t0, self.gravity_factor, \
+            air_rotation=getattr(self, 'air_rotation', False))
+
+
+
+    def calcGravityVelocity(self, observations):
+        """ Fit the speeds of the meteor against time, with which the gravity drop is computed across the path
+            and slowed by the drag (see gravityDropTable). The drag equation with the air density along the
+            line of the last solution is fitted to the distances of the used points from the state vector,
+            which all stations share (see wmpl.Utils.DragVelocity). If it cannot be fitted, the Jacchia (1955)
+            model of the length decelerated by the air, plus the length gained from gravity along the path, is
+            fitted instead.
+
+        Arguments:
+            observations: [list] A list of ObservedPoints objects, with the distances from the state vector.
+
+        Return:
+            (time_rel, vel): [tuple] Times, as the times of the observations (s), and speeds (m/s), from the
+                first to the last time of the used points. None if there are fewer than 4 used points or the
+                speeds cannot be fitted, in which case the meteor is dropped vertically (see
+                applyGravityDrop).
+        """
+
+        used = [obs for obs in observations if not obs.ignore_station] or observations
+        time_all = np.concatenate([obs.time_data[obs.ignore_list == 0] for obs in used])
+        dist_all = np.concatenate([obs.state_vect_dist[obs.ignore_list == 0] for obs in used])
+
+        # The Jacchia model has 4 parameters
+        if len(time_all) < 4:
+            return None
+
+        time_rel = np.linspace(np.min(time_all), np.max(time_all), GRAVITY_DROP_POINTS)
+
+        # Fit the drag equation, which needs a few points for each of its parameters
+        if len(time_all) >= GRAVITY_VEL_MIN_POINTS:
+
+            try:
+                drag_vel = fitDragVelocity(time_all, dist_all, self.state_vect_mini, self.radiant_eci_mini, \
+                    self.jdt_ref, gravity_factor=self.gravity_factor)
+                vel = drag_vel.velocityAtTime(time_rel)
+
+                if np.all(np.isfinite(vel)):
+                    return time_rel, vel
+
+            except (ValueError, np.linalg.LinAlgError):
+                pass
+
+
+        # Fit the length decelerated by the air, without the length gained from gravity along the path
+        dist_drag = dist_all - self.gravityLengthAlongPath(observations, time_all)
+        p0 = [1.0, 1.0, self.v_init, np.median(dist_drag - self.v_init*time_all)]
+
+        try:
+            (a1, a2, v_init, _), _ = scipy.optimize.curve_fit(jacchiaLengthFunc, time_all, dist_drag, p0=p0, \
+                maxfev=10000)
+
+        except (RuntimeError, TypeError, ValueError):
+            a1, a2, v_init = 0.0, 0.0, self.v_init
+
+        # Add the speed gained from gravity along the path to the speed decelerated by the air
+        t0 = dropTimeOrigin(observations)
+        vel = jacchiaVelocityFunc(time_rel, a1, a2, v_init) + self.gravityAlongPath()*(time_rel - t0)
+
+        if not np.all(np.isfinite(vel)):
+            return None
+
+
+        return time_rel, vel
+
+
+
+    def calcV0z(self, eci0, radiant_eci):
+        """ Compute the vertical component of the initial velocity, which the gravity drop needs (self.v0z).
+
+        Arguments:
+            eci0: [ndarray] ECI coordinates of the beginning point (see gravityDropReference).
+            radiant_eci: [ndarray] (x, y, z) components of the unit radiant direction vector.
+        """
+
+        # Radiant should be calculated from radiant_eci, not state_vect_mini, which is always a near 
+        # vertical
+
+        # Compute the apparent radiant
+        ra_a, dec_a = eci2RaDec(radiant_eci)
+
+        # Compute alt/az of the apparent radiant
+        lat_0, lon_0, _ = cartesian2Geo(self.jdt_ref, *eci0)
+        _, alt_a = raDec2AltAz(ra_a, dec_a, self.jdt_ref, lat_0, lon_0)
+
+        # Compute the apparent zenith angle
+        zc = np.pi/2 - alt_a
+
+        self.v0z = -self.v_init*np.cos(zc)
 
 
 
@@ -3666,45 +4878,11 @@ class Trajectory(object):
         ### Compute parameters for gravity drop ###
 
         # Determine the first time
-        t0 = min([obs.time_data[0] for obs in observations])
+        t0 = dropTimeOrigin(observations)
 
-        # Determine the largest distance from the centre of the Earth and use it as the beginning point
-        eci_list = []
-        for obs in observations:
-        
-            # Calculate closest points of approach (observed line of sight to radiant line)
-            obs_cpa, rad_cpa, _ = findClosestPoints(obs.stat_eci_los[0], obs.meas_eci_los[0], state_vect, \
-                radiant_eci)
-
-            eci_list.append(rad_cpa)
-
-        # Find the largest distance from the centre of the Earth
-        max_dist_indx = np.argmax([vectMag(r) for r in eci_list])
-
-        # Get ECI coordinates of the largest distance and the distance itself
-        eci0 = eci_list[max_dist_indx]
-        r0 = vectMag(eci0)
-
-        
-        ### Compute the apparent zenith angle ###
-        # Radiant should be calculated from radiant_eci, not state_vect_mini, which is always a near 
-        # vertical ##
-
-        # Compute the apparent radiant
-        ra_a, dec_a = eci2RaDec(radiant_eci)
-
-        # Compute alt/az of the apparent radiant
-        lat_0, lon_0, _ = cartesian2Geo(self.jdt_ref, *eci0)
-        _, alt_a = raDec2AltAz(ra_a, dec_a, self.jdt_ref, lat_0, lon_0)
-
-        # Compute the apparent zenith angle
-        zc = np.pi/2 - alt_a
-
-        ####
-
-            
-        # Compute the vertical component of the velocity if the orbit was already computed
-        self.v0z = -self.v_init*np.cos(zc)
+        # Beginning point for the gravity drop, and the vertical velocity
+        eci0, r0 = gravityDropReference(observations, state_vect, radiant_eci, v_init=self.v_init)
+        self.calcV0z(eci0, radiant_eci)
 
         ###########################################
 
@@ -3724,6 +4902,10 @@ class Trajectory(object):
             obs.model_range = np.zeros_like(obs.time_data)
 
 
+            # Compute the drop across the path at the times of the points, if the speeds are known
+            drops = self.dropAcrossPath(observations, obs, state_vect, radiant_eci, t0) \
+                if self.gravity_correction else None
+
             # Go through all individual position measurement from each site
             for i, (t, stat, meas) in enumerate(zip(obs.time_data, obs.stat_eci_los, obs.meas_eci_los)):
 
@@ -3738,7 +4920,10 @@ class Trajectory(object):
                     t_rel = t - t0
 
                     # Apply the gravity drop
-                    rad_cpa_grav = applyGravityDrop(rad_cpa, t_rel, r0, self.gravity_factor, self.v0z)
+                    if drops is not None:
+                        rad_cpa_grav = rad_cpa + drops[i]
+                    else:
+                        rad_cpa_grav = applyGravityDrop(rad_cpa, t_rel, r0, self.gravity_factor, self.v0z)
 
                     # Re-do the vector points of closest approach. This is really important!
                     obs_cpa, rad_cpa, d = findClosestPoints(stat, meas, rad_cpa_grav, radiant_eci)
@@ -3822,11 +5007,12 @@ class Trajectory(object):
         # Make a list of observations without any ignored stations in them
         nonignored_observations = [obs for obs in self.observations if not obs.ignore_station]
 
-        # Find the beginning height with the lowest length
-        min_svd_list = [np.min(obs.state_vect_dist) for obs in nonignored_observations]
+        # Find the beginning height with the lowest length, over the points each station reports its beginning
+        #   from, so that an ignored point does not choose the station
+        min_svd_list = [np.min(obs.state_vect_dist[obs.ignore_list == 0]) for obs in nonignored_observations]
         first_begin = min_svd_list.index(min(min_svd_list))
 
-        # Set the coordinates of the height point as the first point
+        # Set the coordinates of the begin point
         self.rbeg_lat = nonignored_observations[first_begin].rbeg_lat
         self.rbeg_lon = nonignored_observations[first_begin].rbeg_lon
         self.rbeg_ele = nonignored_observations[first_begin].rbeg_ele
@@ -3836,11 +5022,11 @@ class Trajectory(object):
         self.rbeg_ele_wgs84 = wmpl.Utils.GeoidHeightEGM96.mslToWGS84Height(self.rbeg_lat, self.rbeg_lon, self.rbeg_ele)
 
 
-        # Find the ending height with the largest length
-        max_svd_list = [np.max(obs.state_vect_dist) for obs in nonignored_observations]
+        # Find the ending height with the largest length, over the used points as above
+        max_svd_list = [np.max(obs.state_vect_dist[obs.ignore_list == 0]) for obs in nonignored_observations]
         last_end = max_svd_list.index(max(max_svd_list))
 
-        # Set coordinates of the lowest point as the last point
+        # Set the coordinates of the end point
         self.rend_lat = nonignored_observations[last_end].rend_lat
         self.rend_lon = nonignored_observations[last_end].rend_lon
         self.rend_ele = nonignored_observations[last_end].rend_ele
@@ -3877,47 +5063,18 @@ class Trajectory(object):
         ### Compute parameters for gravity drop ###
 
         # Determine the first time of observation
-        t0 = min([obs.time_data[0] for obs in observations])
+        t0 = dropTimeOrigin(observations)
 
-        # Determine the largest distance from the centre of the Earth and use it as the beginning point
-        eci_list = []
-        for obs in observations:
-        
-            # Calculate closest points of approach (observed line of sight to radiant line)
-            _, rad_cpa, _ = findClosestPoints(obs.stat_eci_los[0], obs.meas_eci_los[0], state_vect, \
-                radiant_eci)
-
-            eci_list.append(rad_cpa)
-
-        # Find the largest distance from the centre of the Earth
-        max_dist_indx = np.argmax([vectMag(r) for r in eci_list])
-
-        # Get ECI coordinates of the largest distance and the distance itself
-        eci0 = eci_list[max_dist_indx]
-        r0 = vectMag(eci0)
-
-        
-        ### Compute the apparent zenith angle ###
-
-        # Compute the apparent radiant
-        ra_a, dec_a = eci2RaDec(radiant_eci)
-
-        # Compute alt/az of the apparent radiant
-        lat_0, lon_0, _ = cartesian2Geo(self.jdt_ref, *eci0)
-        _, alt_a = raDec2AltAz(ra_a, dec_a, self.jdt_ref, lat_0, lon_0)
-
-        # Compute the apparent zenith angle
-        zc = np.pi/2 - alt_a
-                 
-        # Compute the vertical component of the velocity if the orbit was already computed
-        self.v0z = -self.v_init*np.cos(zc)
+        # Beginning point for the gravity drop, and the vertical velocity
+        eci0, r0 = gravityDropReference(observations, state_vect, radiant_eci, v_init=self.v_init)
+        self.calcV0z(eci0, radiant_eci)
 
         ####
 
         # Go through observations from all stations
         for obs in observations:
 
-            # Init array for modelled ECI positons
+            # Init array for modelled ECI positions
             obs.model_eci = []
 
             # Init array for modelled RA, Dec positions
@@ -3928,6 +5085,10 @@ class Trajectory(object):
             obs.model_azim = np.zeros_like(obs.time_data)
             obs.model_elev = np.zeros_like(obs.time_data)
 
+
+            # Compute the drop across the path at the times of the points, if the speeds are known
+            drops = self.dropAcrossPath(observations, obs, state_vect, radiant_eci, t0) \
+                if self.gravity_correction else None
 
             # Go through all individual position measurement from each site
             for i, (t, jd, stat, meas) in enumerate(zip(obs.time_data, obs.JD_data, obs.stat_eci_los, \
@@ -3944,7 +5105,10 @@ class Trajectory(object):
                     t_rel = t - t0
 
                     # Apply the gravity drop
-                    rad_cpa_grav = applyGravityDrop(rad_cpa, t_rel, r0, self.gravity_factor, self.v0z)
+                    if drops is not None:
+                        rad_cpa_grav = rad_cpa + drops[i]
+                    else:
+                        rad_cpa_grav = applyGravityDrop(rad_cpa, t_rel, r0, self.gravity_factor, self.v0z)
 
                     # Re-do find closest points after gravity drop. This is really important!
                     # The algorithm doesn't care which trajectory point is used to construct the line for the fit,
@@ -4084,7 +5248,7 @@ class Trajectory(object):
 
                     if app_mag is not None:
                         
-                        # Compute absolute magntiude (apparent magnitude at 100 km)
+                        # Compute absolute magnitude (apparent magnitude at 100 km)
                         abs_mag = app_mag + 5*np.log10(100000/obs.model_range[i])
 
                     else:
@@ -4270,25 +5434,25 @@ class Trajectory(object):
             file_name: [str] Name of the report time.
 
         Keyword arguments:
-            uncertainties: [MCUncertainties object] Object contaning uncertainties of every parameter.
+            uncertainties: [MCUncertainties object] Object containing uncertainties of every parameter.
             verbose: [bool] Print the report to the screen. True by default.
             save_results: [bool] If True, the results will be saved to a file.
         """
 
 
         def _uncer(str_format, std_name, multi=1.0, deg=False):
-            """ Internal function. Returns the formatted uncertanty, if the uncertanty is given. If not,
+            """ Internal function. Returns the formatted uncertainty, if the uncertainty is given. If not,
                 it returns nothing. 
 
             Arguments:
-                str_format: [str] String format for the unceertanty.
-                std_name: [str] Name of the uncertanty attribute, e.g. if it is 'x', then the uncertanty is 
+                str_format: [str] String format for the uncertainty.
+                std_name: [str] Name of the uncertainty attribute, e.g. if it is 'x', then the uncertainty is
                     stored in uncertainties.x.
         
             Keyword arguments:
-                multi: [float] Uncertanty multiplier. 1.0 by default. This is used to scale the uncertanty to
+                multi: [float] Uncertainty multiplier. 1.0 by default. Used to scale the uncertainty to
                     different units (e.g. from m/s to km/s).
-                deg: [bool] Converet radians to degrees if True. False by default.
+                deg: [bool] Convert radians to degrees if True. False by default.
                 """
 
             if deg:
@@ -5172,27 +6336,14 @@ class Trajectory(object):
 
 
         # Generate a list of colors to use for markers
-        colors = cm.viridis(np.linspace(0, 0.8, len(self.observations)))
+        colors, alpha = stationColors(len(self.observations))
 
         # Only use one type of markers if there are not a lot of stations
         plot_markers = ['x']
 
-        # Keep colors non-transparent if there are not a lot of stations
-        alpha = 1.0
-
-
-        # If there are more than 5 stations, interleave the colors with another colormap and change up
-        #   markers
+        # If there are more than 5 stations, change up markers
         if len(self.observations) > 5:
-            colors_alt = cm.inferno(np.linspace(0, 0.8, len(self.observations)))
-            for i in range(len(self.observations)):
-                if i%2 == 1:
-                    colors[i] = colors_alt[i]
-
             plot_markers.append("+")
-
-            # Add transparency for more stations
-            alpha = 0.75
 
 
         # Sort observations by first height to preserve color linearity
@@ -5281,7 +6432,12 @@ class Trajectory(object):
         t_max = -np.inf
         t_min = np.inf
 
-        
+        # Take the axis limits from the used stations, or from all stations if all of them are ignored
+        obs_lim_list = [obs for obs in obs_ht_sorted if not obs.ignore_station]
+        if not obs_lim_list:
+            obs_lim_list = obs_ht_sorted
+
+
         first_ignored_plot = True
 
 
@@ -5295,7 +6451,7 @@ class Trajectory(object):
                 ignored_times = obs.time_data[1:][obs.ignore_list[1:] > 0]
                 ignored_velocities = obs.velocities[1:][obs.ignore_list[1:] > 0]
 
-                # Set the label only for the first occurence
+                # Set the label only for the first occurrence
                 if first_ignored_plot:
 
                     ax1.scatter(ignored_velocities/1000, ignored_times, facecolors='none', edgecolors='k', \
@@ -5313,12 +6469,18 @@ class Trajectory(object):
                 c=colors[i].reshape(1,-1), alpha=alpha, label='{:s}'.format(str(obs.station_id)), zorder=3)
 
 
+            # Skip the ignored stations in the axis limits
+            if obs not in obs_lim_list:
+                continue
+
             # Determine the max/min velocity and height, as this is needed for plotting both height/time axes
             vel_max = max(np.max(obs.velocities[1:]/1000), vel_max)
             vel_min = min(np.min(obs.velocities[1:]/1000), vel_min)
 
-            ht_max = max(np.max(obs.meas_ht), ht_max)
-            ht_min = min(np.min(obs.meas_ht), ht_min)
+            # Skip the NaN heights of an ignored station whose clock is far off
+            if np.any(np.isfinite(obs.meas_ht)):
+                ht_max = max(np.nanmax(obs.meas_ht), ht_max)
+                ht_min = min(np.nanmin(obs.meas_ht), ht_min)
 
             t_max = max(np.max(obs.time_data), t_max)
             t_min = min(np.min(obs.time_data), t_min)
@@ -5407,8 +6569,8 @@ class Trajectory(object):
         if self.velocity_fit is not None:
 
             # Get time data range
-            t_min = min([np.min(obs.time_data) for obs in self.observations])
-            t_max = max([np.max(obs.time_data) for obs in self.observations])
+            t_min = min([np.min(obs.time_data) for obs in obs_lim_list])
+            t_max = max([np.max(obs.time_data) for obs in obs_lim_list])
 
             t_range = np.linspace(t_min, t_max, 100)
 
@@ -5462,8 +6624,8 @@ class Trajectory(object):
         ### Plot lat/lon of the meteor ###
         try:
             # Calculate mean latitude and longitude of all meteor points
-            met_lon_mean = meanAngle([x for x in obs.meas_lon for obs in self.observations])
-            met_lat_mean = meanAngle([x for x in obs.meas_lat for obs in self.observations])
+            met_lon_mean = meanAngle([x for obs in self.observations for x in obs.meas_lon])
+            met_lat_mean = meanAngle([x for obs in self.observations for x in obs.meas_lat])
 
 
             # Put coordinates of all sites and the meteor in the one list
@@ -5596,8 +6758,8 @@ class Trajectory(object):
                 from wmpl.Utils.PlotMap_OSM import OSMMap
 
                 # Calculate mean latitude and longitude of all meteor points
-                met_lon_mean = meanAngle([x for x in obs.meas_lon for obs in self.observations])
-                met_lat_mean = meanAngle([x for x in obs.meas_lat for obs in self.observations])
+                met_lon_mean = meanAngle([x for obs in self.observations for x in obs.meas_lon])
+                met_lat_mean = meanAngle([x for obs in self.observations for x in obs.meas_lat])
 
 
                 # Put coordinates of all sites and the meteor in the one list
@@ -5730,7 +6892,7 @@ class Trajectory(object):
                 ignored_times = obs.time_data[obs.ignore_list > 0]
                 ignored_residuals = res[obs.ignore_list > 0]
 
-                # Plot the label only for the first occurence
+                # Plot the label only for the first occurrence
                 if first_ignored_plot:
                     
                     plt.scatter(ignored_times, ignored_residuals, facecolors='none', edgecolors='k', s=20, \
@@ -6110,10 +7272,11 @@ class Trajectory(object):
         Keyword arguments (internal flags, DO NOT SPECIFY MANUALLY!):
             _rerun_timing: [bool] Internal flag. Is it True when everything is recalculated upon estimating 
                 the difference in timings, so it breaks the second trajectory run after updating the values
-                of R.A., Dec, velocity, etc.
-            _rerun_bad_picks: [bool] Internal flag. Is is True when a second pass of trajectory estimation is
+                of R.A., Dec, velocity, etc. The second pass also runs without the timing estimation when the
+                gravity correction is on, as it is the pass which applies the gravity drop.
+            _rerun_bad_picks: [bool] Internal flag. It is True when a second pass of trajectory estimation is
                 run with bad picks removed, thus improving the solution.
-            _mc_run: [bool] Internal flag. True if the solver is calculating the Carlo Run.
+            _mc_run: [bool] Internal flag. True if the solver is calculating a Monte Carlo run.
             _orig_obs: [list] Used for Monte Carlo. A list of original observations, with no added noise.
                 Used for calculating all other parameters after the trajectory with noise has been estimated.
             _prev_toffsets: [ndarray] Internal variable. Used for keeping the initially estimated timing 
@@ -6122,7 +7285,7 @@ class Trajectory(object):
 
         Return:
             traj_best: [Trajectory object] The best trajectory from all Monte Carlo runs. If no Monte Carlo
-                runs were preformed, the pure LoS trajectory will be returned.
+                runs were performed, the pure LoS trajectory will be returned.
 
         """
 
@@ -6132,6 +7295,19 @@ class Trajectory(object):
             print('At least 2 sets of measurements from 2 stations are needed to estimate the trajectory!')
 
             return None
+
+
+        # Trajectories pickled before the beginning of the gravity drop was kept do not have it
+        if not hasattr(self, 'gravity_r0'):
+            self.gravity_r0 = None
+
+        # Trajectories pickled before the drop across the path was added do not have the speeds for it
+        if not hasattr(self, 'gravity_vel'):
+            self.gravity_vel = None
+
+        # Trajectories pickled before the rotation of the air was added are solved with it
+        if not hasattr(self, 'air_rotation'):
+            self.air_rotation = True
 
 
         ### Recompute the reference JD and all times so that the first time starts at 0 ###
@@ -6147,9 +7323,31 @@ class Trajectory(object):
             for obs in self.observations:
                 obs.time_data -= t0
 
+                # Offset the excluded time range too, so it still matches the times when the observations are
+                #   reinitialized for the next pass (observations pickled before it was added do not have it)
+                if getattr(obs, 'excluded_time', None) is not None:
+                    obs.excluded_time = [ex_time - t0 for ex_time in obs.excluded_time]
+
+
+            # Offset the times of the speeds of the gravity drop too
+            if self.gravity_vel is not None:
+                self.gravity_vel = (self.gravity_vel[0] - t0, self.gravity_vel[1])
 
             # Recompute the reference JD to corresponds with t0
             self.jdt_ref = self.jdt_ref + t0/86400.0
+
+            # Recompute the given RA and Dec for the new reference JD, as they are converted to azimuth and
+            #   elevation at the reference JD when the observations are reinitialized for the next pass
+            if self.meastype == 1:
+                for obs in self.observations:
+
+                    # R.A. and Dec. computed at each point's own time are converted at those times, not at the
+                    #   reference JD, so they stay as they are
+                    if getattr(obs, 'radec_jd', None) is not None:
+                        continue
+
+                    obs.meas1, obs.meas2 = altAz2RADec_vect(obs.azim_data, obs.elev_data, self.jdt_ref, \
+                        obs.lat, obs.lon)
 
 
         ###################################################################################
@@ -6278,8 +7476,8 @@ class Trajectory(object):
         # Calculate the initial sum and angles deviating from the radiant line
         angle_sum = angleSumMeasurements2Line(self.observations, self.state_vect, \
              self.best_conv_inter.radiant_eci, weights=weights, \
-             gravity=(_rerun_timing and self.gravity_correction), gravity_factor=self.gravity_factor, 
-             v0z=self.v0z
+             gravity=(_rerun_timing and self.gravity_correction), gravity_factor=self.gravity_factor, \
+             v0z=self.v0z, r0=self.gravity_r0, gravity_vel=self.gravity_vel, air_rotation=self.air_rotation
              )
 
         if self.verbose:
@@ -6289,10 +7487,54 @@ class Trajectory(object):
         # Set the initial guess for the state vector and the radiant from the intersecting plane solution
         p0 = np.r_[self.state_vect, self.best_conv_inter.radiant_eci]
 
-        # Perform the minimization of angle deviations. The gravity will only be compansated for after the
-        #   initial estimate of timing differences
-        minimize_solution = scipy.optimize.minimize(minimizeAngleCost, p0, args=(self.observations, weights, 
-            (_rerun_timing and self.gravity_correction), self.gravity_factor, self.v0z), method="Nelder-Mead")
+        # Perform the minimization of angle deviations. The gravity will only be compensated for in the second
+        #   pass, which has the vertical velocity from the first
+        minimize_args = (self.observations, weights, (_rerun_timing and self.gravity_correction), \
+            self.gravity_factor, self.v0z, self.gravity_r0, self.gravity_vel, self.air_rotation)
+        minimize_solution = scipy.optimize.minimize(minimizeAngleCost, p0, args=minimize_args, \
+            method=nelderMeadLine)
+
+        # Get the number of restarts, which trajectories pickled before the option was added do not have
+        los_restarts = getattr(self, 'los_restarts', 0)
+
+        # Restart the minimization from its own solution if requested, and keep a converged solution when
+        #   its restart does not converge
+        for _ in range(los_restarts):
+
+            restarted_solution = scipy.optimize.minimize(minimizeAngleCost, minimize_solution.x, \
+                args=minimize_args, method=nelderMeadLine)
+
+            if restarted_solution.success or (not minimize_solution.success):
+                minimize_solution = restarted_solution
+
+        # Continue a minimization which ran out of function evaluations from the beginning of the meteor on
+        #   the line
+        for _ in range(LOS_CONTINUE_RUNS):
+
+            if minimize_solution.success:
+                break
+
+            restart = np.r_[moveStateVector(minimize_solution.x[:3], minimize_solution.x[3:], \
+                self.observations), vectNorm(minimize_solution.x[3:])]
+            minimize_solution = scipy.optimize.minimize(minimizeAngleCost, restart, args=minimize_args, \
+                method=nelderMeadLine)
+
+        # Minimize again from the previous solution (of the pass before the timing was estimated, or the main
+        #   solution in a Monte Carlo run) if its cost is lower than at the minimum found, as the minimization
+        #   can stop in a distant local minimum
+        if (self.state_vect_mini is not None) and (self.radiant_eci_mini is not None):
+
+            previous = np.r_[self.state_vect_mini, self.radiant_eci_mini]
+
+            if minimizeAngleCost(previous, *minimize_args) < minimize_solution.fun:
+
+                previous_solution = scipy.optimize.minimize(minimizeAngleCost, previous, \
+                    args=minimize_args, method=nelderMeadLine)
+
+                if previous_solution.success or (not minimize_solution.success):
+                    minimize_solution = previous_solution
+
+        unbounded_solution = minimize_solution
 
         # NOTE
         # Other minimization methods were tried as well, but all produce higher fit residuals than Nelder-Mead.
@@ -6303,7 +7545,7 @@ class Trajectory(object):
 
 
         # If the minimization diverged, bound the solution to +/-10% of state vector
-        if np.max(np.abs(minimize_solution.x[:3] - self.state_vect)/self.state_vect) > 0.1:
+        if stateVectorDiverged(minimize_solution.x[:3], self.state_vect):
 
             print('WARNING! Unbounded state vector optimization failed!')
             print('Trying bounded minimization to +/-10% of state vector position.')
@@ -6320,8 +7562,13 @@ class Trajectory(object):
             print('BOUNDS:', bounds)
             print('p0:', p0)
             minimize_solution = scipy.optimize.minimize(minimizeAngleCost, p0, args=(self.observations, \
-                weights, (_rerun_timing and self.gravity_correction), self.gravity_factor, self.v0z), 
-                bounds=bounds, method='SLSQP')
+                weights, (_rerun_timing and self.gravity_correction), self.gravity_factor, self.v0z, \
+                self.gravity_r0, self.gravity_vel, self.air_rotation), bounds=bounds, method='SLSQP')
+
+            # Keep the unbounded solution if it converged and the bounded one did not converge or is worse
+            if unbounded_solution.success and ((not minimize_solution.success) or \
+                (unbounded_solution.fun < minimize_solution.fun)):
+                minimize_solution = unbounded_solution
 
 
         if self.verbose:
@@ -6335,7 +7582,7 @@ class Trajectory(object):
         # Set the minimization status
         self.los_mini_status = minimize_solution.success
 
-        # If the minimization succeded
+        # If the minimization succeeded
         if minimize_solution.success:
         
             # Unpack the solution
@@ -6360,7 +7607,7 @@ class Trajectory(object):
 
             print('Angle minimization failed altogether!')
 
-            # If the solution did not succeed, set the values to intersecting plates solution
+            # If the solution did not succeed, set the values to intersecting planes solution
             self.radiant_eci_mini = self.best_conv_inter.radiant_eci
 
             # Normalize radiant direction
@@ -6395,7 +7642,8 @@ class Trajectory(object):
 
 
         # Calculate velocity at each point
-        self.calcVelocity(self.state_vect_mini, self.radiant_eci_mini, self.observations, weights)
+        self.calcVelocity(self.state_vect_mini, self.radiant_eci_mini, self.observations, weights, \
+            gravity=(_rerun_timing and self.gravity_correction))
 
 
         if self.verbose and self.estimate_timing_vel:
@@ -6471,9 +7719,10 @@ class Trajectory(object):
             return None
 
 
-        # Calculate velocity at each point with updated timings
-        self.calcVelocity(self.state_vect_mini, self.radiant_eci_mini, self.observations, weights,
-            calc_res=_rerun_timing)
+        # Calculate velocity at each point with updated timings, and the timing residuals only if the timing
+        #   was estimated
+        self.calcVelocity(self.state_vect_mini, self.radiant_eci_mini, self.observations, weights, \
+            calc_res=(_rerun_timing and self.estimate_timing_vel), calc_lengths=False)
 
 
         ### RERUN THE TRAJECTORY ESTIMATION WITH UPDATED TIMINGS ###
@@ -6491,9 +7740,17 @@ class Trajectory(object):
                 self.time_diffs_final += self.time_diffs
 
 
-            # After the timing has been estimated, everything needs to be recalculated from scratch
-            if self.estimate_timing_vel:
+            # After the timing has been estimated, everything needs to be recalculated from scratch, and so
+            #   with the gravity correction, as the first pass fits the line without the gravity drop, which
+            #   needs the vertical velocity from that pass
+            if self.estimate_timing_vel or self.gravity_correction:
 
+
+                # Fit the speeds of the meteor against time in this pass, with which the gravity pass drops it.
+                #   In a Monte Carlo run they are fitted to the observations the velocity was computed on, before
+                #   switching back to the noisy ones, which have the same times
+                if self.gravity_correction:
+                    self.gravity_vel = self.calcGravityVelocity(self.observations)
 
                 # If doing a Monte Carlo run, switch back to noisy observations
                 if _mc_run and (_orig_obs is not None):
@@ -6504,7 +7761,6 @@ class Trajectory(object):
 
                     # Switch back to noisy observations, but with updated timing
                     self.observations = self.obs_noisy
-
 
                 # Make a copy of observations
                 temp_observations = copy.deepcopy(self.observations)
@@ -6527,6 +7783,12 @@ class Trajectory(object):
                 for station in self.fixed_time_offsets:
                     self.fixed_time_offsets[station] = 0.0
 
+                # Compute the beginning point and the vertical velocity of the gravity pass from this pass
+                if self.gravity_correction:
+                    eci0, self.gravity_r0 = gravityDropReference(self.observations, self.state_vect_mini, \
+                        self.radiant_eci_mini, v_init=self.v_init)
+                    self.calcV0z(eci0, self.radiant_eci_mini)
+
                 # Re-run the trajectory estimation with updated timings. This will update all calculated
                 # values up to this point
                 self.run(_rerun_timing=True, _prev_toffsets=self.time_diffs, _orig_obs=_orig_obs)
@@ -6545,7 +7807,7 @@ class Trajectory(object):
 
 
         # If running a Monte Carlo runs, switch the observations to the original ones, so noise does not 
-        # infuence anything except the radiant position
+        #   influence anything except the radiant position
         if _mc_run and (_orig_obs is not None):
                 
             # Store the noisy observations for later
@@ -6568,6 +7830,9 @@ class Trajectory(object):
         # Do a Jacchia exponential fit to the lag, per every station
         self.jacchia_fit = self.fitJacchiaLag(self.observations)
 
+        # Store the time from which the drop is computed, for the fits which take the solution later
+        self.gravity_t0 = dropTimeOrigin(self.observations)
+
         # Calculate latitude, longitude and altitude of each point closest to the radiant line, in WGS84
         self.calcLLA(self.state_vect_mini, self.radiant_eci_mini, self.observations)
 
@@ -6575,13 +7840,14 @@ class Trajectory(object):
         # Compute the initial velocity as the average velocity of all points above the given height
         #   (optional)
         if self.v_init_ht is not None:
-            v_ht_avg, intercept_ht_avg = self.calcAvgVelocityAboveHt(self.observations, 1000*self.v_init_ht, \
-                weights)
+            v_ht_avg, intercept_ht_avg, v_ht_stddev = self.calcAvgVelocityAboveHt(self.observations, \
+                1000*self.v_init_ht, weights)
 
             # Assign this average velocity as the initial velocity if the fit was successful
             if v_ht_avg is not None:
                 
                 self.v_init = v_ht_avg
+                self.v_init_stddev = v_ht_stddev
                 self.velocity_fit = [self.v_init, intercept_ht_avg]
 
                 # Recalculate the lag
@@ -6615,20 +7881,31 @@ class Trajectory(object):
                 # Remove all picks which deviate more than N sigma in angular residuals
                 for obs in self.observations:
 
-                    # Find the indicies of picks which are within N sigma
-                    good_picks = obs.ang_res < (np.mean(obs.ang_res) \
-                        + self.reject_n_sigma_outliers*obs.ang_res_std)
+                    # Skip ignored stations
+                    if obs.ignore_station:
+                        continue
+
+                    # Skip stations with fewer than 4 used picks
+                    used = obs.ignore_list == 0
+                    if np.count_nonzero(used) < 4:
+                        continue
+
+                    # Find the used picks within N sigma of the used picks (the RMS of the residuals is
+                    #   computed from the used picks only)
+                    good_picks = used & (obs.ang_res < (np.mean(obs.ang_res[used]) \
+                        + self.reject_n_sigma_outliers*obs.ang_res_std))
 
                     # If the number of good picks is below 4, do not remove any picks
                     if np.count_nonzero(good_picks) < 4:
                         continue
 
-                    # Check if any picks were removed
-                    if np.count_nonzero(good_picks) < len(obs.ang_res):
-                        picks_rejected += len(obs.ang_res) - np.count_nonzero(good_picks)
+                    # Check if any used picks are rejected
+                    rejected = used & (~good_picks)
+                    if np.any(rejected):
+                        picks_rejected += np.count_nonzero(rejected)
 
                         # Ignore bad picks
-                        obs.ignore_list[~good_picks] = 1
+                        obs.ignore_list[rejected] = 1
 
 
                 # Run only if some picks were rejected
@@ -6657,7 +7934,7 @@ class Trajectory(object):
 
                 else:
                     if self.verbose:
-                        print("All picks are within 3 sigma...")
+                        print("All picks are within {:.1f} sigma...".format(self.reject_n_sigma_outliers))
 
 
             else:
@@ -6684,9 +7961,14 @@ class Trajectory(object):
             # Calculate the orbit of the meteor
             # If the LoS estimation failed, then the plane intersection solution will be used for the orbit,
             # which needs to have fixed stations and the average velocity should be the reference velocity
+
+            # Store the orbit-solve convention so it can be reused when the orbit is recomputed later
+            #   (e.g. by MetSim's saveUpdatedOrbit), taking the status of the last pass of the fit
+            self.orbit_los_success = bool(self.los_mini_status)
+
             self.orbit = calcOrbit(self.radiant_eci_mini, self.v_init, self.v_avg, self.state_vect_mini, \
-                self.rbeg_jd, stations_fixed=(not minimize_solution.success), \
-                reference_init=minimize_solution.success, v_init_stddev_direct=self.v_init_stddev)
+                self.rbeg_jd, stations_fixed=(not self.orbit_los_success), \
+                reference_init=self.orbit_los_success, v_init_stddev_direct=self.v_init_stddev)
 
             if self.verbose:
                 print(self.orbit.__repr__(v_init_ht=self.v_init_ht))
@@ -6713,7 +7995,7 @@ class Trajectory(object):
             if uncertainties is not None:
                 traj_uncer = copy.deepcopy(uncertainties)
 
-                # Remove the list of all MC trajectires (it is unecessarily big)
+                # Remove the list of all MC trajectories (it is unnecessarily big)
                 traj_uncer.mc_traj_list = []
 
                 # Set the uncertainties to the best trajectory (maintain compatibility with older version 
@@ -6787,6 +8069,17 @@ class Trajectory(object):
                 # Save trajectory report with original points
                 self.saveReport(self.output_dir, self.file_name + '_report.txt', \
                         uncertainties=uncertainties, verbose = not self.monte_carlo)
+
+                # Save the 3D KML, without stopping the solver if it fails
+                if getattr(self, 'save_kml', False):
+
+                    try:
+                        from wmpl.Utils.TrajectoryKML import trajectoryToKML
+                        trajectoryToKML(self, os.path.join(self.output_dir, self.file_name + '_3D.kml'), \
+                            measured=getattr(self, 'kml_measured', False))
+
+                    except Exception as e:
+                        print("WARNING: The 3D KML could not be saved: {:s}".format(repr(e)))
 
 
             # Save and show plots

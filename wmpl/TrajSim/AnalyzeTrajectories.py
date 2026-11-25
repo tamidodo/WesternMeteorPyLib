@@ -208,8 +208,8 @@ def plotRadiants(pickle_trajs, plot_type='geocentric', ra_cent=None, dec_cent=No
             - 'geocentric' - RA_g, Dec_g, Vg plot
             - 'heliocentric ecliptic' - Lh, Bg, Vh plot
 
-        ra_cent: [float] Right ascension used for selecing only radiants in given radius on the sky (degrees).
-        dec_cent: [float] Declination used for selecing only radiants in given radius on the sky (degrees).
+        ra_cent: [float] Right ascension used for selecting only radiants in given radius on the sky (degrees).
+        dec_cent: [float] Declination used for selecting only radiants in given radius on the sky (degrees).
         radius: [float] Radius for selecting radiants centred on ra_cent, dec_cent (degrees).
 
         plt_handle: [plt object] Matplotlib plt handle (e.g. plt variable when doing plt.plot(...)).
@@ -336,9 +336,9 @@ def plotRadiants(pickle_trajs, plot_type='geocentric', ra_cent=None, dec_cent=No
         ra_stddev = np.degrees(scipy.stats.circstd(x_list))
         dec_stddev = np.degrees(np.std(y_list))
 
-        label += "{:d} orbits, $\sigma_{{RA}}$ = {:.2f}$\degree$".format(len(x_list), ra_stddev)
+        label += "{:d} orbits, $\\sigma_{{RA}}$ = {:.2f}$\\degree$".format(len(x_list), ra_stddev)
         label += ", "
-        label += "$\sigma_{{Dec}}$ = {:.2f}$\degree$".format(dec_stddev)
+        label += "$\\sigma_{{Dec}}$ = {:.2f}$\\degree$".format(dec_stddev)
 
 
     plt_handle.scatter(x_list, y_list, c=z_list, label=label, **kwargs)
@@ -363,7 +363,7 @@ def plotOrbitElements(pickle_trajs, plt_type='sol_a', plt_handle=None, **kwargs)
         la_sun_list = []
         a_list = []
 
-        # Go thorugh all pickles
+        # Go through all pickles
         for pick in pickle_trajs:
 
             # NOTE: In older versions of the simulator, the orbit is named 'orb', while the trajectory 
@@ -401,7 +401,7 @@ def plotOrbitElements(pickle_trajs, plt_type='sol_a', plt_handle=None, **kwargs)
         # Get the X ticks
         x_ticks = [item for item in plt.gca().get_xticks()]
 
-        # Substract 360 from all ticks larger then 360
+        # Subtract 360 from all ticks larger then 360
         x_ticks = [xt if xt < 360 else str(float(xt) - 360) for xt in x_ticks]
         
 
@@ -467,7 +467,7 @@ def calcTrajSimDiffs(traj_sim_pairs, radiant_extent, vg_extent):
         traj_sim_pairs: [list] A list of (Trajectory, SimMeteor) pairs.
         radiant_extent: [float] Maximum radiant error (deg). If the error is larger, the trajectory will be
             counted as a failure.
-        vg_extent: [float] Maxium velocity error (km/s). If the error is larger, the trajectory will be
+        vg_extent: [float] Maximum velocity error (km/s). If the error is larger, the trajectory will be
             counted as a failure.
 
     Return:
@@ -583,7 +583,7 @@ def compareTrajToSim(dir_path, sim_meteors, traj_list, solver_name, radiant_exte
     plt.xlim(0, radiant_extent)
     plt.ylim(-vg_extent, vg_extent)
 
-    plt.title('{:s}, failures: {:d}, $\sigma_R$ = {:.2f} deg, $\sigma_V$ = {:.2f} km/s'.format(solver_name, \
+    plt.title('{:s}, failures: {:d}, $\\sigma_R$ = {:.2f} deg, $\\sigma_V$ = {:.2f} km/s'.format(solver_name, \
         failed_count, radiant_std, vg_std))
 
     plt.xlabel('Radiant difference (deg)')
@@ -999,7 +999,7 @@ if __name__ == "__main__":
 
     # Make sure all lengths are the same
     if sum([len(solvers), len(solvers_plot_labels), len(markers), len(sizes)]) != 4*len(solvers):
-        print('The lenghts of solvers, plots, markers and sizes is not the same!')
+        print('The lengths of solvers, plots, markers and sizes is not the same!')
         sys.exit()
 
     # Make plots from data with different solvers
@@ -1160,9 +1160,9 @@ if __name__ == "__main__":
 
     # label = 'MPF:'
 
-    # label += " $\sigma_{{RA}}$ = {:.2f}$\degree$".format(ra_stddev)
+    # label += " $\\sigma_{{RA}}$ = {:.2f}$\\degree$".format(ra_stddev)
     # label += ", "
-    # label += "$\sigma_{{Dec}}$ = {:.2f}$\degree$".format(dec_stddev)
+    # label += "$\\sigma_{{Dec}}$ = {:.2f}$\\degree$".format(dec_stddev)
 
     # m.scatter(ra_list, dec_list, c=vg_list, label=label, marker='o', s=10)
 
